@@ -1,0 +1,7 @@
+yfinance>=0.2.31
+pandas>=2.0.0
+pandas_ta>=0.3.14b
+plotly>=5.15.0
+streamlit>=1.28.0
+pyarrow>=12.0.0
+numpy>=1.24.0
