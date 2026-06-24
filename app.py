@@ -19,6 +19,8 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import threading
+import time
 from datetime import datetime, timedelta
 
 import pandas as pd
@@ -71,6 +73,68 @@ st.title("Tokyo Stock Exchange — Screener & Signal Dashboard")
 loader = YFinanceDataLoader()
 engine = TechnicalEngine()
 
+# ---------------------------------------------------------------------------
+# Background auto-scan thread
+# ---------------------------------------------------------------------------
+
+_auto_scan_thread: threading.Thread | None = None
+_auto_scan_stop = threading.Event()
+_auto_scan_last: str = ""
+_auto_scan_lock = threading.Lock()
+
+DEFAULT_ALERT_TICKERS = [
+    "7203", "6758", "9984", "8306", "6501",
+    "7267", "9434", "6861", "8411", "7751",
+]
+
+
+def _auto_scan_worker(
+    tickers: list[str],
+    lookback_days: int,
+    interval_min: int,
+) -> None:
+    """Background thread: scan tickers and send alerts every interval_min."""
+    scanner = AlertScanner(tickers=tickers, lookback_days=lookback_days)
+    logger.info("Auto-scan thread started (interval=%d min)", interval_min)
+
+    while not _auto_scan_stop.is_set():
+        try:
+            results = scanner.scan_and_alert()
+            total = sum(len(v) for v in results.values())
+            now_str = datetime.now().strftime("%H:%M")
+            with _auto_scan_lock:
+                global _auto_scan_last  # noqa: PLW0602
+                _auto_scan_last = f"{now_str} — {total} signals"
+            logger.info("Auto-scan complete: %d signals", total)
+        except Exception:
+            logger.exception("Auto-scan failed")
+
+        _auto_scan_stop.wait(interval_min * 60)
+
+
+def start_auto_scan(
+    tickers: list[str] | None = None,
+    lookback_days: int = 365,
+    interval_min: int = 30,
+) -> None:
+    """Start background auto-scan thread if not already running."""
+    global _auto_scan_thread  # noqa: PLW0602
+    if _auto_scan_thread and _auto_scan_thread.is_alive():
+        logger.info("Auto-scan already running")
+        return
+    _auto_scan_stop.clear()
+    _auto_scan_thread = threading.Thread(
+        target=_auto_scan_worker,
+        args=(tickers or DEFAULT_ALERT_TICKERS, lookback_days, interval_min),
+        daemon=True,
+    )
+    _auto_scan_thread.start()
+
+
+def stop_auto_scan() -> None:
+    """Stop background auto-scan thread."""
+    _auto_scan_stop.set()
+
 
 # ---------------------------------------------------------------------------
 # Sidebar — Global params
@@ -92,13 +156,35 @@ with st.sidebar:
     if not tg_ok and not sl_ok:
         st.caption("Set Streamlit Secrets or .env to enable alerts")
 
+    st.markdown("---")
+    st.markdown("### Auto Scan")
+    auto_scan_on = st.checkbox("Auto Scan", value=False, key="auto_scan_toggle")
+    scan_interval = st.selectbox("Interval", [15, 30, 60], index=1, key="scan_interval", disabled=not auto_scan_on)
+
+    if auto_scan_on:
+        running = _auto_scan_thread and _auto_scan_thread.is_alive()
+        st.markdown(f"- Status: **{'🟢 Running' if running else '🔴 Starting...'}**")
+        with _auto_scan_lock:
+            if _auto_scan_last:
+                st.caption(f"Last scan: {_auto_scan_last}")
+        if not running:
+            start_auto_scan(
+                tickers=DEFAULT_ALERT_TICKERS,
+                lookback_days=365,
+                interval_min=scan_interval,
+            )
+            st.rerun()
+    else:
+        if _auto_scan_thread and _auto_scan_thread.is_alive():
+            stop_auto_scan()
+
 
 # ---------------------------------------------------------------------------
 # Tab layout
 # ---------------------------------------------------------------------------
 
 tab_chart, tab_screen, tab_signals, tab_backtest, tab_portfolio, tab_earnings, tab_chain, tab_alerts, tab_guide = st.tabs(
-    ["Chart", "Screener", "Signals", "Backtest", "Portfolio", "Earnings", "Smart Screen", "Alerts", "Chỉ số & Chiến lược"]
+    ["Chart", "Screener", "Signals", "Backtest", "Portfolio", "Earnings", "Smart Screen", "Alerts", "Guide"]
 )
 
 
@@ -682,7 +768,7 @@ For daily automated scan, set up **GitHub Actions**:
 
 
 # ============================
-# TAB 9: Chỉ số & Chiến lược
+# TAB 9: Guide
 # ============================
 
 with tab_guide:
