@@ -13,9 +13,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Optional
 
-import numpy as np
 import pandas as pd
 import pandas_ta as ta
 
@@ -41,7 +39,7 @@ class Signal:
     strategy: str
     date: datetime
     price: float
-    stop_loss: Optional[float] = None
+    stop_loss: float | None = None
     metadata: dict = field(default_factory=dict)
 
     def __str__(self) -> str:
@@ -60,7 +58,7 @@ class Signal:
 class TechnicalEngine:
     """Compute common technical indicators on an OHLCV DataFrame.
 
-    All methods mutate a copy and return the enriched DataFrame.
+    All methods return a new DataFrame. Use enrich() for single-pass computation.
     """
 
     @staticmethod
@@ -124,7 +122,7 @@ class TechnicalEngine:
         atr_period: int = 14,
         vol_sma_period: int = 20,
     ) -> pd.DataFrame:
-        """Add all standard indicators at once.
+        """Add all standard indicators in a single pass (1 copy only).
 
         Args:
             df: Raw OHLCV DataFrame.
@@ -136,10 +134,23 @@ class TechnicalEngine:
         Returns:
             Enriched DataFrame.
         """
-        out = self.add_moving_averages(df, sma_periods)
-        out = self.add_rsi(out, rsi_period)
-        out = self.add_atr(out, atr_period)
-        out = self.add_volume_sma(out, vol_sma_period)
+        out = df.copy()  # Single copy
+
+        # SMA
+        for p in sma_periods:
+            out[f"SMA_{p}"] = ta.sma(out["Close"], length=p)
+
+        # RSI
+        out[f"RSI_{rsi_period}"] = ta.rsi(out["Close"], length=rsi_period)
+
+        # ATR
+        out[f"ATR_{atr_period}"] = ta.atr(
+            out["High"], out["Low"], out["Close"], length=atr_period
+        )
+
+        # Volume SMA
+        out[f"VOL_SMA_{vol_sma_period}"] = ta.sma(out["Volume"], length=vol_sma_period)
+
         return out
 
 
@@ -171,7 +182,7 @@ class VolumeBreakoutStrategy(BaseStrategy):
 
     Conditions:
       1. Close > highest High of previous N bars (default 20).
-      2. Volume > multiplier * SMA(volume, 20) (default multiplier=1.5).
+      2. Volume > multiplier * SMA(volume, 20) (default multiplier=1.2).
       3. Close > SMA_20 (trend filter).
     """
 
@@ -180,7 +191,7 @@ class VolumeBreakoutStrategy(BaseStrategy):
     def __init__(
         self,
         lookback: int = 20,
-        volume_mult: float = 1.5,
+        volume_mult: float = 1.2,
         vol_sma_period: int = 20,
     ) -> None:
         self.lookback = lookback
@@ -202,7 +213,10 @@ class VolumeBreakoutStrategy(BaseStrategy):
 
         required = {"Close", "High", "Volume", "SMA_20", vol_sma_col}
         if not required.issubset(df.columns):
-            logger.warning("Missing columns for VolumeBreakout: %s", required - set(df.columns))
+            logger.debug("VolumeBreakout skip %s: missing %s", ticker, required - set(df.columns))
+            return signals
+        if df.empty or len(df) < self.lookback + 1:
+            logger.debug("VolumeBreakout skip %s: insufficient rows (%d)", ticker, len(df))
             return signals
 
         highs = df["High"]
@@ -226,8 +240,9 @@ class VolumeBreakoutStrategy(BaseStrategy):
                 continue
 
             price = float(closes.iloc[i])
-            atr_val = float(row.get("ATR_14", 0) or 0)
-            sl = round(price - 2 * atr_val, 2) if atr_val else None
+            atr_raw = row.get("ATR_14")
+            atr_val = float(atr_raw) if atr_raw is not None and not pd.isna(atr_raw) else 0.0
+            sl = round(price - 2 * atr_val, 2) if atr_val > 0 else None
 
             signals.append(
                 Signal(
@@ -284,7 +299,10 @@ class PullbackMAStrategy(BaseStrategy):
 
         required = {"Close", trend_col, rsi_col}
         if not required.issubset(df.columns):
-            logger.warning("Missing columns for PullbackMA: %s", required - set(df.columns))
+            logger.debug("PullbackMA skip %s: missing %s", ticker, required - set(df.columns))
+            return signals
+        if df.empty or len(df) < 2:
+            logger.debug("PullbackMA skip %s: insufficient rows (%d)", ticker, len(df))
             return signals
 
         for i in range(1, len(df)):
@@ -313,8 +331,9 @@ class PullbackMAStrategy(BaseStrategy):
                 # Crossed above MA
                 if prev_close < prev_ma and curr_close >= curr_ma:
                     price = float(curr_close)
-                    atr_val = float(row.get("ATR_14", 0) or 0)
-                    sl = round(price - 2 * atr_val, 2) if atr_val else None
+                    atr_raw = row.get("ATR_14")
+                    atr_val = float(atr_raw) if atr_raw is not None and not pd.isna(atr_raw) else 0.0
+                    sl = round(price - 2 * atr_val, 2) if atr_val > 0 else None
 
                     signals.append(
                         Signal(

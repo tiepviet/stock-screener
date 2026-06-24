@@ -10,12 +10,11 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Optional
 
 import numpy as np
 import pandas as pd
 
-from .technical_engine import BaseStrategy, Signal, SignalType
+from .technical_engine import BaseStrategy, Signal
 
 logger = logging.getLogger(__name__)
 
@@ -32,8 +31,9 @@ class Trade:
     strategy: str
     entry_date: datetime
     entry_price: float
-    exit_date: Optional[datetime] = None
-    exit_price: Optional[float] = None
+    stop_loss: float = 0.0
+    exit_date: datetime | None = None
+    exit_price: float | None = None
     shares: int = 0
     pnl: float = 0.0
     pnl_pct: float = 0.0
@@ -118,6 +118,8 @@ class Backtester:
         risk_per_trade: float = 0.01,
         hard_stop_pct: float = 0.07,
         max_holding_days: int = 60,
+        take_profit_pct: float = 0.0,
+        commission_pct: float = 0.0,
     ) -> None:
         """Initialize backtester.
 
@@ -126,11 +128,19 @@ class Backtester:
             risk_per_trade: Fraction of capital risked per trade.
             hard_stop_pct: Maximum loss before forced exit.
             max_holding_days: Max days to hold before forced exit (0 = no limit).
+            take_profit_pct: Take-profit threshold from entry (0 = disabled).
+            commission_pct: Commission per trade as fraction of position value (0 = none).
         """
+        if take_profit_pct < 0:
+            raise ValueError("take_profit_pct must be >= 0")
+        if not 0 <= commission_pct < 1:
+            raise ValueError("commission_pct must be in [0, 1)")
         self.initial_capital = initial_capital
         self.risk_per_trade = risk_per_trade
         self.hard_stop_pct = hard_stop_pct
         self.max_holding_days = max_holding_days
+        self.take_profit_pct = take_profit_pct
+        self.commission_pct = commission_pct
 
     def run(
         self,
@@ -152,14 +162,14 @@ class Backtester:
         """
         capital = self.initial_capital
         trades: list[Trade] = []
-        open_trade: Optional[Trade] = None
+        open_trade: Trade | None = None
         equity = [capital]
 
-        # Build signal lookup: date -> signal
-        signal_map: dict[datetime, Signal] = {}
+        # Build signal lookup: date -> list[Signal] (multiple strategies per bar)
+        signal_map: dict[datetime, list[Signal]] = {}
         for sig in signals:
             d = sig.date if isinstance(sig.date, datetime) else pd.Timestamp(sig.date).to_pydatetime()
-            signal_map[d] = sig
+            signal_map.setdefault(d, []).append(sig)
 
         for i in range(len(df)):
             row = df.iloc[i]
@@ -170,10 +180,24 @@ class Backtester:
             # --- Check open position ---
             if open_trade is not None:
                 days_held = (current_date - open_trade.entry_date).days
+                take_profit_price = (
+                    open_trade.entry_price * (1 + self.take_profit_pct)
+                    if self.take_profit_pct > 0
+                    else float("inf")
+                )
+
+                # Take-profit (intra-bar: if high >= TP)
+                if row["High"] >= take_profit_price:
+                    open_trade.close(current_date, take_profit_price, "TAKE_PROFIT")
+                    open_trade.pnl -= self.commission_pct * open_trade.entry_price * open_trade.shares
+                    capital += open_trade.pnl
+                    trades.append(open_trade)
+                    open_trade = None
 
                 # Stop-loss check (intra-bar: if low <= SL)
-                if row["Low"] <= open_trade.stop_loss:
+                elif row["Low"] <= open_trade.stop_loss:
                     open_trade.close(current_date, open_trade.stop_loss, "STOP_LOSS")
+                    open_trade.pnl -= self.commission_pct * open_trade.entry_price * open_trade.shares
                     capital += open_trade.pnl
                     trades.append(open_trade)
                     open_trade = None
@@ -181,13 +205,14 @@ class Backtester:
                 # Max holding period
                 elif self.max_holding_days > 0 and days_held >= self.max_holding_days:
                     open_trade.close(current_date, float(row["Close"]), "MAX_HOLD")
+                    open_trade.pnl -= self.commission_pct * open_trade.entry_price * open_trade.shares
                     capital += open_trade.pnl
                     trades.append(open_trade)
                     open_trade = None
 
             # --- Check for new entry ---
             if open_trade is None and current_date in signal_map:
-                sig = signal_map[current_date]
+                sig = signal_map[current_date][0]
                 entry_price = float(row["Open"])  # enter at next-bar open
                 hard_stop = entry_price * (1 - self.hard_stop_pct)
                 strategy_stop = sig.stop_loss if sig.stop_loss else hard_stop
@@ -217,8 +242,12 @@ class Backtester:
 
             # Track equity
             if open_trade is not None:
-                unrealized = (float(row["Close"]) - open_trade.entry_price) * open_trade.shares
-                equity.append(capital + unrealized + open_trade.entry_price * open_trade.shares)
+                close = float(row["Close"])
+                if pd.isna(close):
+                    equity.append(capital)
+                else:
+                    unrealized = (close - open_trade.entry_price) * open_trade.shares
+                    equity.append(capital + unrealized + open_trade.entry_price * open_trade.shares)
             else:
                 equity.append(capital)
 
@@ -228,6 +257,7 @@ class Backtester:
             if isinstance(last_date, pd.Timestamp):
                 last_date = last_date.to_pydatetime()
             open_trade.close(last_date, float(df["Close"].iloc[-1]), "END_OF_DATA")
+            open_trade.pnl -= self.commission_pct * open_trade.entry_price * open_trade.shares
             capital += open_trade.pnl
             trades.append(open_trade)
 
@@ -280,7 +310,12 @@ class Backtester:
         # CAGR
         final = float(equity_curve.iloc[-1]) if len(equity_curve) > 0 else self.initial_capital
         years = max(1, (pd.Timestamp(end_date) - pd.Timestamp(start_date)).days / 365.25)
-        cagr = (final / self.initial_capital) ** (1 / years) - 1
+        ratio = final / self.initial_capital if self.initial_capital > 0 else 1.0
+        # Power on negative base is complex; clamp to 0 (total loss)
+        if ratio <= 0:
+            cagr = -1.0
+        else:
+            cagr = ratio ** (1 / years) - 1
 
         total_return = (final - self.initial_capital) / self.initial_capital
 

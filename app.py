@@ -20,31 +20,27 @@ import logging
 import os
 import sys
 import threading
-import time
 from datetime import datetime, timedelta
 
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+from src.stock_screener.alert import AlertScanner, SlackSender, TelegramSender
+from src.stock_screener.backtest import Backtester
+
 # Local modules
 from src.stock_screener.data_loader import YFinanceDataLoader
+from src.stock_screener.earnings_calendar import EarningsCalendar
 from src.stock_screener.fundamental_screener import Condition, FundamentalScreener
+from src.stock_screener.multi_timeframe import MultiTimeframeConfirmer
+from src.stock_screener.portfolio import PortfolioTracker
 from src.stock_screener.risk_management import RiskManager
+from src.stock_screener.screen_chain import ScreenChainer
 from src.stock_screener.technical_engine import (
     PullbackMAStrategy,
     TechnicalEngine,
     VolumeBreakoutStrategy,
-)
-from src.stock_screener.backtest import Backtester
-from src.stock_screener.portfolio import PortfolioTracker
-from src.stock_screener.earnings_calendar import EarningsCalendar
-from src.stock_screener.screen_chain import ScreenChainer
-from src.stock_screener.alert import (
-    AlertScanner,
-    TelegramSender,
-    SlackSender,
-    format_signal_alert,
 )
 
 logging.basicConfig(
@@ -183,8 +179,8 @@ with st.sidebar:
 # Tab layout
 # ---------------------------------------------------------------------------
 
-tab_chart, tab_screen, tab_signals, tab_backtest, tab_portfolio, tab_earnings, tab_chain, tab_alerts, tab_guide = st.tabs(
-    ["Chart", "Screener", "Signals", "Backtest", "Portfolio", "Earnings", "Smart Screen", "Alerts", "Guide"]
+tab_chart, tab_screen, tab_signals, tab_backtest, tab_portfolio, tab_earnings, tab_chain, tab_mtf, tab_alerts, tab_guide = st.tabs(
+    ["Chart", "Screener", "Signals", "Backtest", "Portfolio", "Earnings", "Smart Screen", "MTF", "Alerts", "Guide"]
 )
 
 
@@ -247,7 +243,7 @@ with tab_chart:
                     template="plotly_dark",
                 )
 
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width='stretch')
 
                 # Volume subplot
                 if show_vol:
@@ -266,7 +262,7 @@ with tab_chart:
                         template="plotly_dark",
                         margin=dict(t=30, b=10),
                     )
-                    st.plotly_chart(vol_fig, use_container_width=True)
+                    st.plotly_chart(vol_fig, width='stretch')
 
                 # Data table
                 with st.expander("Raw Data"):
@@ -286,10 +282,10 @@ with tab_screen:
 
     col_a, col_b = st.columns(2)
     with col_a:
-        min_roe = st.number_input("Min ROE (%)", value=10.0, step=1.0) / 100
+        min_roe = st.number_input("Min ROE (%)", value=8.0, step=1.0) / 100
         max_pe = st.number_input("Max P/E", value=20.0, step=1.0)
     with col_b:
-        max_pb = st.number_input("Max P/B", value=3.0, step=0.5)
+        max_pb = st.number_input("Max P/B", value=2.0, step=0.5)
         min_div = st.number_input("Min Dividend Yield (%)", value=1.0, step=0.5) / 100
 
     tickers_input = st.text_area(
@@ -325,7 +321,7 @@ with tab_screen:
                     "dividend_yield": "{:.2%}",
                     "market_cap": "¥{:,.0f}",
                 }),
-                use_container_width=True,
+                width='stretch',
             )
 
 
@@ -339,7 +335,7 @@ with tab_signals:
     col_x, col_y = st.columns(2)
     with col_x:
         vb_lookback = st.slider("Breakout Lookback", 10, 50, 20)
-        vb_vol_mult = st.slider("Volume Multiplier", 1.0, 3.0, 1.5, 0.1)
+        vb_vol_mult = st.slider("Volume Multiplier", 1.0, 3.0, 1.2, 0.1)
     with col_y:
         pm_rsi_max = st.slider("Pullback Max RSI", 40, 80, 60)
 
@@ -352,6 +348,10 @@ with tab_signals:
 
     if st.button("Scan Signals", key="scan_signals"):
         tickers = [t.strip() for t in scan_tickers_input.strip().splitlines() if t.strip()]
+        if not tickers:
+            st.warning("No tickers to scan")
+            st.stop()
+
         end = datetime.now().strftime("%Y-%m-%d")
         start = (datetime.now() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
 
@@ -362,24 +362,37 @@ with tab_signals:
 
         all_signals = []
         progress = st.progress(0)
+        errors = []
 
-        for idx, ticker in enumerate(tickers):
+        def _scan_one(ticker: str) -> list:
             try:
                 df = loader.fetch_ohlcv(ticker, start, end)
                 df = engine.enrich(df)
-
-                vb_signals = vb_strategy.generate_signals(df, ticker)
-                pm_signals = pm_strategy.generate_signals(df, ticker)
-                all_signals.extend(vb_signals)
-                all_signals.extend(pm_signals)
-
+                sigs = []
+                sigs.extend(vb_strategy.generate_signals(df, ticker))
+                sigs.extend(pm_strategy.generate_signals(df, ticker))
+                return sigs
             except Exception as e:
-                st.warning(f"Failed: {ticker} — {e}")
-                logger.exception("Scan failed for %s", ticker)
+                return [("error", ticker, str(e))]
 
-            progress.progress((idx + 1) / len(tickers))
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        with ThreadPoolExecutor(max_workers=min(len(tickers), 8)) as pool:
+            futures = {pool.submit(_scan_one, t): t for t in tickers}
+            done_count = 0
+            for future in as_completed(futures):
+                result = future.result()
+                if result and isinstance(result[0], tuple) and result[0][0] == "error":
+                    _, ticker, msg = result[0]
+                    errors.append(f"{ticker}: {msg}")
+                else:
+                    all_signals.extend(result)
+                done_count += 1
+                progress.progress(done_count / len(tickers))
 
         progress.empty()
+
+        for err in errors:
+            st.warning(f"Failed: {err}")
 
         if not all_signals:
             st.info("No signals found in this period.")
@@ -406,7 +419,7 @@ with tab_signals:
                         "risk_amount": "¥{:,.0f}",
                         "risk_pct": "{:.2%}",
                     }),
-                    use_container_width=True,
+                    width='stretch',
                 )
 
                 # Summary
@@ -415,8 +428,48 @@ with tab_signals:
                 st.metric("Total Allocation", f"¥{total_alloc:,.0f}")
                 st.metric("Total Risk", f"¥{total_risk:,.0f}")
                 st.metric("Positions", len(plans))
+
+                # --- Export + Add to portfolio ---
+                csv = plan_df.to_csv(index=False).encode("utf-8")
+                st.download_button(
+                    "Download plans CSV",
+                    data=csv,
+                    file_name=f"position_plans_{datetime.now():%Y%m%d_%H%M}.csv",
+                    mime="text/csv",
+                    key="dl_plans",
+                )
+
+                pf = PortfolioTracker(total_capital=capital, max_sector_pct=0.30)
+                if st.button("Add all to portfolio", key="add_all_pf"):
+                    added = 0
+                    for plan in plans:
+                        try:
+                            pf.add_position(plan)
+                            added += 1
+                        except Exception as e:
+                            logger.exception("add_position failed for %s", plan.ticker)
+                            st.warning(f"{plan.ticker}: {e}")
+                    st.success(f"Added {added}/{len(plans)} positions")
             else:
                 st.info("No positions within capital limit.")
+
+            # --- Signals CSV export ---
+            if all_signals:
+                sig_df = pd.DataFrame([{
+                    "ticker": s.ticker,
+                    "signal_type": s.signal_type.value,
+                    "strategy": s.strategy,
+                    "date": s.date,
+                    "price": s.price,
+                    "stop_loss": s.stop_loss,
+                } for s in all_signals])
+                st.download_button(
+                    "Download signals CSV",
+                    data=sig_df.to_csv(index=False).encode("utf-8"),
+                    file_name=f"signals_{datetime.now():%Y%m%d_%H%M}.csv",
+                    mime="text/csv",
+                    key="dl_sigs",
+                )
 
             # Strategy breakdown
             st.subheader("By Strategy")
@@ -426,7 +479,7 @@ with tab_signals:
 
 
 # ============================
-# TAB 5: Backtest
+# TAB 4: Backtest
 # ============================
 
 with tab_backtest:
@@ -437,17 +490,18 @@ with tab_backtest:
         bt_ticker = st.text_input("Ticker", value="7203", key="bt_ticker")
         bt_strategy = st.selectbox("Strategy", ["VolumeBreakout", "PullbackMA"], key="bt_strat")
         bt_capital = st.number_input("Initial Capital (JPY)", value=10_000_000, step=1_000_000, key="bt_cap")
+        bt_take_profit = st.number_input("Take Profit (%)", value=0.0, step=2.0, key="bt_tp") / 100
     with col_b2:
         bt_lookback = st.slider("Lookback (days)", 180, 1095, 730, 30, key="bt_look")
         bt_risk = st.slider("Risk/Trade (%)", 0.5, 5.0, 1.0, 0.1, key="bt_risk") / 100
         bt_max_hold = st.slider("Max Hold (days)", 10, 120, 60, 5, key="bt_hold")
+        bt_commission = st.number_input("Commission (%)", value=0.0, step=0.05, key="bt_comm") / 100
 
     if st.button("Run Backtest", key="run_bt"):
         end = datetime.now().strftime("%Y-%m-%d")
         start = (datetime.now() - timedelta(days=bt_lookback)).strftime("%Y-%m-%d")
         try:
             df = loader.fetch_ohlcv(bt_ticker, start, end)
-            df = engine.enrich(df)
 
             if bt_strategy == "VolumeBreakout":
                 strategy = VolumeBreakoutStrategy()
@@ -459,6 +513,8 @@ with tab_backtest:
                 risk_per_trade=bt_risk,
                 hard_stop_pct=hard_stop,
                 max_holding_days=bt_max_hold,
+                take_profit_pct=bt_take_profit,
+                commission_pct=bt_commission,
             )
             result = bt.run_multi(df, strategy, bt_ticker)
 
@@ -493,22 +549,32 @@ with tab_backtest:
                     template="plotly_dark",
                     yaxis_title="Capital (JPY)",
                 )
-                st.plotly_chart(eq_fig, use_container_width=True)
+                st.plotly_chart(eq_fig, width='stretch')
 
             # Trade log
             if result.trades:
                 st.subheader("Trade Log")
                 trades_df = pd.DataFrame([{
                     "Ticker": t.ticker,
+                    "Strategy": t.strategy,
                     "Entry": t.entry_date.strftime("%Y-%m-%d") if t.entry_date else "",
-                    "Entry ¥": f"¥{t.entry_price:,.0f}",
+                    "EntryPrice": t.entry_price,
+                    "Shares": t.shares,
+                    "StopLoss": t.stop_loss,
                     "Exit": t.exit_date.strftime("%Y-%m-%d") if t.exit_date else "",
-                    "Exit ¥": f"¥{t.exit_price:,.0f}" if t.exit_price else "",
-                    "P/L ¥": f"¥{t.pnl:,.0f}",
-                    "P/L %": f"{t.pnl_pct:.2%}",
+                    "ExitPrice": t.exit_price if t.exit_price else 0.0,
+                    "Pnl": t.pnl,
+                    "PnlPct": t.pnl_pct,
                     "Reason": t.exit_reason,
                 } for t in result.trades])
-                st.dataframe(trades_df, use_container_width=True)
+                st.dataframe(trades_df, width='stretch')
+                st.download_button(
+                    "Download trades CSV",
+                    data=trades_df.to_csv(index=False).encode("utf-8"),
+                    file_name=f"backtest_trades_{bt_ticker}_{bt_strategy}_{datetime.now():%Y%m%d_%H%M}.csv",
+                    mime="text/csv",
+                    key="dl_bt_trades",
+                )
 
         except Exception as e:
             st.error(f"Backtest failed: {e}")
@@ -516,7 +582,7 @@ with tab_backtest:
 
 
 # ============================
-# TAB 6: Portfolio
+# TAB 5: Portfolio
 # ============================
 
 with tab_portfolio:
@@ -548,7 +614,7 @@ with tab_portfolio:
             hole=0.3,
         )])
         exp_fig.update_layout(height=300, template="plotly_dark")
-        st.plotly_chart(exp_fig, use_container_width=True)
+        st.plotly_chart(exp_fig, width='stretch')
 
         over = portfolio.overexposed_sectors()
         if over:
@@ -565,19 +631,34 @@ with tab_portfolio:
             "stop_loss": "¥{:.2f}",
             "unrealized_pnl": "¥{:,.0f}",
             "unrealized_pnl_pct": "{:.2%}",
-        }), use_container_width=True)
+        }), width='stretch')
+        st.download_button(
+            "Download open positions CSV",
+            data=pos_df.to_csv(index=False).encode("utf-8"),
+            file_name=f"open_positions_{datetime.now():%Y%m%d_%H%M}.csv",
+            mime="text/csv",
+            key="dl_open_pos",
+        )
     else:
         st.info("No open positions.")
+
 
     # Closed trades
     closed_df = portfolio.closed_trades_df()
     if not closed_df.empty:
         st.subheader("Closed Trades")
-        st.dataframe(closed_df, use_container_width=True)
+        st.dataframe(closed_df, width='stretch')
+        st.download_button(
+            "Download closed trades CSV",
+            data=closed_df.to_csv(index=False).encode("utf-8"),
+            file_name=f"closed_trades_{datetime.now():%Y%m%d_%H%M}.csv",
+            mime="text/csv",
+            key="dl_closed",
+        )
 
 
 # ============================
-# TAB 7: Earnings
+# TAB 6: Earnings
 # ============================
 
 with tab_earnings:
@@ -623,7 +704,7 @@ with tab_earnings:
 
 
 # ============================
-# TAB 8: Smart Screen
+# TAB 7: Smart Screen
 # ============================
 
 with tab_chain:
@@ -643,7 +724,7 @@ Pipeline: **Fundamental** (ROE, P/E, P/B, EPS) → **Technical** (SMA200 uptrend
     col_c1, col_c2 = st.columns(2)
     with col_c1:
         chain_top_n = st.slider("Top N Results", 5, 30, 10, key="chain_top")
-        chain_roe = st.number_input("Min ROE (%)", value=10.0, step=1.0, key="chain_roe") / 100
+        chain_roe = st.number_input("Min ROE (%)", value=8.0, step=1.0, key="chain_roe") / 100
     with col_c2:
         chain_pe = st.number_input("Max P/E", value=20.0, step=1.0, key="chain_pe")
         chain_lookback = st.slider("Technical Lookback", 180, 730, 365, 30, key="chain_lb")
@@ -677,13 +758,59 @@ Pipeline: **Fundamental** (ROE, P/E, P/B, EPS) → **Technical** (SMA200 uptrend
                 "Tech Score": f"{s.technical_score:.3f}",
                 "Sector": s.sector,
             } for s in results])
-            st.dataframe(rank_df, use_container_width=True)
+            st.dataframe(rank_df, width='stretch')
         else:
             st.info("No results. Try relaxing filters.")
 
 
 # ============================
-# TAB 8: Alerts
+# TAB 8: Multi-Timeframe
+# ============================
+
+with tab_mtf:
+    st.subheader("Multi-Timeframe Confirmation")
+    st.markdown("Daily signals confirmed by weekly trend. Higher confidence = stronger signal.")
+
+    mtf_tickers = st.text_area(
+        "Tickers (one per line)",
+        value="7203\n6758\n9984\n8306\n6501",
+        height=150,
+        key="mtf_tickers",
+    )
+    mtf_min_conf = st.slider("Min confidence", 0.5, 1.0, 0.7, 0.05, key="mtf_conf")
+
+    if st.button("Run MTF Scan", key="run_mtf"):
+        tickers = [t.strip() for t in mtf_tickers.strip().splitlines() if t.strip()]
+        if not tickers:
+            st.warning("No tickers to scan")
+            st.stop()
+        confirmer = MultiTimeframeConfirmer(min_confidence=mtf_min_conf)
+        with st.spinner("Fetching daily + weekly data..."):
+            confirmed = confirmer.scan_tickers(tickers, lookback_days=545)
+        if not confirmed:
+            st.info("No signals passed the confidence threshold.")
+        else:
+            st.success(f"{len(confirmed)} confirmed signals")
+            rows = [{
+                "Ticker": c.ticker,
+                "Strategy": c.strategy,
+                "Entry": f"¥{c.entry_price:,.0f}",
+                "SL": f"¥{c.stop_loss:,.0f}" if c.stop_loss else "—",
+                "Confidence": f"{c.confidence:.0%}",
+                "Weekly": "✓" if c.weekly_signal else "—",
+            } for c in confirmed]
+            st.dataframe(pd.DataFrame(rows), width='stretch')
+            st.download_button(
+                "Download CSV",
+                data=pd.DataFrame(rows).to_csv(index=False).encode("utf-8"),
+                file_name=f"mtf_signals_{datetime.now():%Y%m%d_%H%M}.csv",
+                mime="text/csv",
+                key="dl_mtf",
+            )
+
+
+# ============================
+# TAB 9: Alerts
 # ============================
 
 with tab_alerts:

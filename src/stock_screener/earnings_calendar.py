@@ -10,8 +10,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timedelta
-from typing import Optional
+from datetime import datetime
 
 import pandas as pd
 
@@ -25,12 +24,12 @@ class EarningsInfo:
     """Earnings information for a single ticker."""
 
     ticker: str
-    next_earnings_date: Optional[datetime] = None
-    days_until_earnings: Optional[int] = None
+    next_earnings_date: datetime | None = None
+    days_until_earnings: int | None = None
     is_upcoming: bool = False
-    last_report_date: Optional[datetime] = None
-    estimated_eps: Optional[float] = None
-    actual_eps: Optional[float] = None
+    last_report_date: datetime | None = None
+    estimated_eps: float | None = None
+    actual_eps: float | None = None
 
 
 class EarningsCalendar:
@@ -42,7 +41,7 @@ class EarningsCalendar:
 
     def __init__(
         self,
-        loader: Optional[BaseDataLoader] = None,
+        loader: BaseDataLoader | None = None,
         warning_days: int = 14,
     ) -> None:
         """Initialize earnings calendar.

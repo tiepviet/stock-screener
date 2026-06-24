@@ -8,8 +8,9 @@ dividend yield, market cap. Pluggable via data_loader BaseDataLoader.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
-from typing import Callable, Optional
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import ClassVar
 
 import pandas as pd
 
@@ -32,21 +33,18 @@ class Condition:
         value: Threshold value to compare against.
     """
 
+    _OPS: ClassVar[dict[str, Callable[[float, float], bool]]] = {
+        ">": lambda a, b: a > b,
+        ">=": lambda a, b: a >= b,
+        "<": lambda a, b: a < b,
+        "<=": lambda a, b: a <= b,
+        "==": lambda a, b: a == b,
+        "!=": lambda a, b: a != b,
+    }
+
     metric: str
     operator: str
     value: float
-
-    _OPS: dict[str, Callable[[float, float], bool]] = field(default=None, init=False)
-
-    def __post_init__(self) -> None:
-        self._OPS = {
-            ">": lambda a, b: a > b,
-            ">=": lambda a, b: a >= b,
-            "<": lambda a, b: a < b,
-            "<=": lambda a, b: a <= b,
-            "==": lambda a, b: a == b,
-            "!=": lambda a, b: a != b,
-        }
 
     def evaluate(self, data: dict) -> bool:
         """Check if a fundamentals dict passes this condition.
@@ -55,7 +53,8 @@ class Condition:
             data: Dict of fundamental metrics (from data_loader).
 
         Returns:
-            True if condition passes or metric is missing (permissive).
+            True if condition passes. Missing values fail the check
+            (strict — prevents stocks with no fundamental data from passing).
         """
         val = data.get(self.metric)
         if val is None:
@@ -82,7 +81,7 @@ class FundamentalScreener:
         results = screener.screen(["7203", "6758", "9984"], conditions)
     """
 
-    def __init__(self, loader: Optional[BaseDataLoader] = None) -> None:
+    def __init__(self, loader: BaseDataLoader | None = None) -> None:
         """Initialize screener.
 
         Args:
@@ -115,10 +114,13 @@ class FundamentalScreener:
         if not conditions:
             logger.warning("No conditions specified, returning all fundamentals")
 
+        # Batch fetch all fundamentals (uses cache)
+        all_fundies = self.loader.fetch_batch_fundamentals(tickers)
+
         rows: list[dict] = []
 
         for ticker in tickers:
-            fundies = self.loader.fetch_fundamentals(ticker)
+            fundies = all_fundies.get(ticker, {})
             fundies["ticker"] = ticker
 
             if all(c.evaluate(fundies) for c in conditions):

@@ -16,11 +16,8 @@ from __future__ import annotations
 import argparse
 import logging
 import os
-import sys
 from datetime import datetime, timedelta
-from typing import Optional
 
-import pandas as pd
 import requests
 
 from .data_loader import YFinanceDataLoader
@@ -62,7 +59,7 @@ DEFAULT_TICKERS = [
 class TelegramSender:
     """Send messages via Telegram Bot API."""
 
-    def __init__(self, bot_token: Optional[str] = None, chat_id: Optional[str] = None) -> None:
+    def __init__(self, bot_token: str | None = None, chat_id: str | None = None) -> None:
         self.bot_token = bot_token or os.getenv("TELEGRAM_BOT_TOKEN", "")
         self.chat_id = chat_id or os.getenv("TELEGRAM_CHAT_ID", "")
 
@@ -109,7 +106,7 @@ class TelegramSender:
 class SlackSender:
     """Send messages via Slack Webhook (Incoming Webhook)."""
 
-    def __init__(self, webhook_url: Optional[str] = None) -> None:
+    def __init__(self, webhook_url: str | None = None) -> None:
         self.webhook_url = webhook_url or os.getenv("SLACK_WEBHOOK_URL", "")
         if not self.webhook_url:
             logger.warning("SLACK_WEBHOOK_URL not set — messages will only be logged")
@@ -239,11 +236,11 @@ class AlertScanner:
 
     def __init__(
         self,
-        tickers: Optional[list[str]] = None,
+        tickers: list[str] | None = None,
         lookback_days: int = 365,
-        strategies: Optional[list[BaseStrategy]] = None,
-        telegram_sender: Optional[TelegramSender] = None,
-        slack_sender: Optional[SlackSender] = None,
+        strategies: list[BaseStrategy] | None = None,
+        telegram_sender: TelegramSender | None = None,
+        slack_sender: SlackSender | None = None,
     ) -> None:
         """Initialize scanner.
 
@@ -298,17 +295,10 @@ class AlertScanner:
         results = self.scan()
         scan_date = datetime.now().strftime("%Y-%m-%d %H:%M")
 
-        # Send summary
+        # Send combined report (summary includes all signals)
         summary = format_summary_report(results, scan_date)
         self.telegram_sender.send(summary)
         self.slack_sender.send(summary)
-
-        # Send individual BUY signals
-        all_signals = [s for sigs in results.values() for s in sigs]
-        if all_signals:
-            detail = format_signal_alert(all_signals, scan_date)
-            self.telegram_sender.send(detail)
-            self.slack_sender.send(detail)
 
         return results
 
@@ -325,8 +315,9 @@ def run_daemon(tickers: list[str], lookback: int = 365) -> None:
         lookback: Days of historical data.
     """
     try:
-        import schedule
         import time
+
+        import schedule
     except ImportError:
         logger.error("Install 'schedule': pip install schedule")
         return

@@ -11,13 +11,14 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Optional
 
 import pandas as pd
 
 from .data_loader import BaseDataLoader, YFinanceDataLoader
 from .fundamental_screener import Condition, FundamentalScreener
-from .technical_engine import BaseStrategy, PullbackMAStrategy, TechnicalEngine, VolumeBreakoutStrategy
+from .technical_engine import (
+    TechnicalEngine,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -60,8 +61,8 @@ class ScreenChainer:
 
     def __init__(
         self,
-        loader: Optional[BaseDataLoader] = None,
-        weights: Optional[dict[str, float]] = None,
+        loader: BaseDataLoader | None = None,
+        weights: dict[str, float] | None = None,
     ) -> None:
         """Initialize chainer.
 
@@ -85,7 +86,7 @@ class ScreenChainer:
     def run(
         self,
         tickers: list[str],
-        fundamental_conditions: Optional[list[Condition]] = None,
+        fundamental_conditions: list[Condition] | None = None,
         top_n: int = 20,
         lookback_days: int = 365,
     ) -> list[ScoredStock]:
@@ -103,9 +104,9 @@ class ScreenChainer:
         # --- Pass 1: Fundamental filter ---
         if fundamental_conditions is None:
             fundamental_conditions = [
-                Condition("roe", ">", 0.10),
+                Condition("roe", ">", 0.08),
                 Condition("pe", "<", 20.0),
-                Condition("pb", "<", 3.0),
+                Condition("pb", "<", 2.0),
                 Condition("eps", ">", 0),
                 Condition("dividend_yield", ">", 0.005),
             ]
@@ -165,8 +166,8 @@ class ScreenChainer:
             except Exception:
                 logger.exception("Technical scoring failed for %s", ticker)
 
-        # Sort and rank
-        scored.sort(key=lambda s: s.score, reverse=True)
+        # Sort by composite score, then ticker (stable)
+        scored.sort(key=lambda s: (-s.score, s.ticker))
         for i, s in enumerate(scored):
             s.rank = i + 1
 

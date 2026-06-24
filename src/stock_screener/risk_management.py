@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Optional
 
 from .technical_engine import Signal, SignalType
 
@@ -82,9 +81,14 @@ class RiskManager:
 
         Returns:
             PositionPlan with shares, stop-loss, and risk amounts.
+
+        Raises:
+            ValueError: If signal is not BUY, or entry price is non-positive.
         """
         if signal.signal_type != SignalType.BUY:
             raise ValueError(f"Position sizing only for BUY signals, got {signal.signal_type}")
+        if signal.price <= 0:
+            raise ValueError(f"Signal price must be positive, got {signal.price}")
 
         entry = signal.price
         hard_stop = entry * (1 - self.hard_stop_pct)
@@ -153,7 +157,7 @@ class RiskManager:
         self,
         position: PositionPlan,
         current_price: float,
-    ) -> Optional[str]:
+    ) -> str | None:
         """Check if current price triggers stop-loss.
 
         Args:

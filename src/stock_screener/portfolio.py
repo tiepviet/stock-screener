@@ -9,10 +9,9 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
 import pandas as pd
 
@@ -21,7 +20,7 @@ from .risk_management import PositionPlan
 
 logger = logging.getLogger(__name__)
 
-PORTFOLIO_FILE = Path("portfolio.json")
+PORTFOLIO_FILE = Path(__file__).parent.parent.parent / "portfolio.json"
 
 
 # ---------------------------------------------------------------------------
@@ -44,7 +43,13 @@ class PortfolioPosition:
     unrealized_pnl_pct: float = 0.0
 
     def update_price(self, price: float) -> None:
-        """Update current price and recalculate P/L."""
+        """Update current price and recalculate P/L.
+
+        Raises:
+            ValueError: If price is negative.
+        """
+        if price < 0:
+            raise ValueError(f"Price must be non-negative, got {price}")
         self.current_price = price
         self.unrealized_pnl = (price - self.entry_price) * self.shares
         self.unrealized_pnl_pct = (price - self.entry_price) / self.entry_price
@@ -114,11 +119,19 @@ class PortfolioTracker:
 
         Args:
             plan: PositionPlan from risk_management module.
-            sector: Sector classification string.
+            sector: Sector classification string. If empty, attempts to
+                auto-fetch from yfinance (best-effort, falls back to "").
         """
         if plan.ticker in self.positions:
             logger.warning("Position for %s already exists — skipping", plan.ticker)
             return
+
+        if not sector:
+            try:
+                fundies = self.loader.fetch_fundamentals(plan.ticker)
+                sector = fundies.get("sector") or ""
+            except Exception:
+                logger.debug("Sector auto-fetch failed for %s", plan.ticker)
 
         pos = PortfolioPosition(
             ticker=plan.ticker,
@@ -127,7 +140,7 @@ class PortfolioTracker:
             entry_date=datetime.now().strftime("%Y-%m-%d"),
             stop_loss=plan.stop_loss,
             strategy=plan.strategy,
-            sector=sector,
+            sector=sector or "Unknown",
         )
         self.positions[plan.ticker] = pos
         self._save()
@@ -166,18 +179,52 @@ class PortfolioTracker:
         logger.info("Closed %s: P/L=¥%.0f (%.2f%%) [%s]", ticker, pnl, pnl_pct * 100, reason)
 
     def update_prices(self) -> None:
-        """Refresh current prices for all open positions."""
+        """Refresh current prices for all open positions.
+
+        Price lookup order: fast_info.lastPrice -> previousClose -> info.currentPrice
+        -> regularMarketPrice -> previousClose. Fails silently per position; the
+        last known price is retained on error.
+        """
+        import yfinance as yf
+
         for ticker, pos in self.positions.items():
             try:
                 normalized = self.loader.normalize_ticker(ticker)
-                import yfinance as yf
-                info = yf.Ticker(normalized).fast_info
-                price = info.get("lastPrice") or info.get("previousClose")
-                if price:
+                t = yf.Ticker(normalized)
+                price = self._fetch_latest_price(t)
+                if price is not None and price > 0:
                     pos.update_price(float(price))
+                else:
+                    logger.warning("%s: no price available — keeping last known", ticker)
             except Exception:
                 logger.exception("Failed to update price for %s", ticker)
         self._save()
+
+    @staticmethod
+    def _fetch_latest_price(t) -> float | None:
+        """Try multiple price sources. Returns None if all fail."""
+        try:
+            fi = t.fast_info
+            if hasattr(fi, "get"):
+                price = fi.get("lastPrice") or fi.get("previousClose")
+            else:
+                price = getattr(fi, "last_price", None) or getattr(fi, "previous_close", None)
+            if price:
+                return float(price)
+        except Exception:
+            pass
+
+        try:
+            info = t.info
+            if info:
+                for key in ("currentPrice", "regularMarketPrice", "previousClose"):
+                    val = info.get(key)
+                    if val:
+                        return float(val)
+        except Exception:
+            pass
+
+        return None
 
     # --- Analytics ---
 
@@ -223,7 +270,10 @@ class PortfolioTracker:
         """
         triggered: list[str] = []
         for ticker, pos in self.positions.items():
-            if pos.current_price > 0 and pos.current_price <= pos.stop_loss:
+            if pos.current_price <= 0:
+                logger.debug("%s: no current price — skipping SL check", ticker)
+                continue
+            if pos.current_price <= pos.stop_loss:
                 triggered.append(ticker)
                 logger.warning("STOP LOSS: %s @ %.2f (SL=%.2f)", ticker, pos.current_price, pos.stop_loss)
         return triggered

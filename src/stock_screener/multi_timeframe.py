@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Optional
 
 import pandas as pd
 
@@ -34,9 +33,9 @@ class ConfirmedSignal:
     signal_type: SignalType
     strategy: str
     entry_price: float
-    stop_loss: Optional[float]
+    stop_loss: float | None
     daily_signal: Signal
-    weekly_signal: Optional[Signal]
+    weekly_signal: Signal | None
     confidence: float  # 0.0 to 1.0
 
     def __str__(self) -> str:
@@ -61,8 +60,8 @@ class MultiTimeframeConfirmer:
 
     def __init__(
         self,
-        loader: Optional[BaseDataLoader] = None,
-        strategies: Optional[list[BaseStrategy]] = None,
+        loader: BaseDataLoader | None = None,
+        strategies: list[BaseStrategy] | None = None,
         min_confidence: float = 0.6,
     ) -> None:
         """Initialize confirmer.
