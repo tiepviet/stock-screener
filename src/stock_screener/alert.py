@@ -103,6 +103,56 @@ class TelegramSender:
 
 
 # ---------------------------------------------------------------------------
+# Slack sender
+# ---------------------------------------------------------------------------
+
+class SlackSender:
+    """Send messages via Slack Webhook (Incoming Webhook)."""
+
+    def __init__(self, webhook_url: Optional[str] = None) -> None:
+        self.webhook_url = webhook_url or os.getenv("SLACK_WEBHOOK_URL", "")
+        if not self.webhook_url:
+            logger.warning("SLACK_WEBHOOK_URL not set — messages will only be logged")
+
+    @staticmethod
+    def _html_to_mrkdwn(text: str) -> str:
+        """Convert Telegram HTML formatting to Slack mrkdwn.
+
+        - <b>text</b>  → *text*
+        - <code>text</code>  → `text`
+        - strip all other tags
+        """
+        import re
+        text = re.sub(r"<b>(.*?)</b>", r"*\1*", text)
+        text = re.sub(r"<code>(.*?)</code>", r"`\1`", text)
+        text = re.sub(r"<[^>]+>", "", text)
+        return text
+
+    def send(self, text: str) -> bool:
+        """Send a message to the configured Slack channel.
+
+        Args:
+            text: Message text (HTML formatting auto-converted to Slack mrkdwn).
+
+        Returns:
+            True if sent successfully, False otherwise.
+        """
+        if not self.webhook_url:
+            logger.info("Slack not configured. Message:\n%s", text)
+            return False
+
+        try:
+            payload = {"text": self._html_to_mrkdwn(text)}
+            resp = requests.post(self.webhook_url, json=payload, timeout=10)
+            resp.raise_for_status()
+            logger.info("Slack message sent")
+            return True
+        except Exception:
+            logger.exception("Failed to send Slack message")
+            return False
+
+
+# ---------------------------------------------------------------------------
 # Alert formatter
 # ---------------------------------------------------------------------------
 
@@ -185,14 +235,15 @@ def format_summary_report(
 # ---------------------------------------------------------------------------
 
 class AlertScanner:
-    """Scan a list of tickers and send alerts via Telegram."""
+    """Scan a list of tickers and send alerts via Telegram & Slack."""
 
     def __init__(
         self,
         tickers: Optional[list[str]] = None,
         lookback_days: int = 365,
         strategies: Optional[list[BaseStrategy]] = None,
-        sender: Optional[TelegramSender] = None,
+        telegram_sender: Optional[TelegramSender] = None,
+        slack_sender: Optional[SlackSender] = None,
     ) -> None:
         """Initialize scanner.
 
@@ -200,7 +251,8 @@ class AlertScanner:
             tickers: List of raw tickers. Defaults to DEFAULT_TICKERS.
             lookback_days: Days of historical data to fetch.
             strategies: List of strategies to run. Defaults to both built-in strategies.
-            sender: TelegramSender instance.
+            telegram_sender: TelegramSender instance.
+            slack_sender: SlackSender instance.
         """
         self.tickers = tickers or DEFAULT_TICKERS
         self.lookback_days = lookback_days
@@ -208,7 +260,8 @@ class AlertScanner:
             VolumeBreakoutStrategy(),
             PullbackMAStrategy(),
         ]
-        self.sender = sender or TelegramSender()
+        self.telegram_sender = telegram_sender or TelegramSender()
+        self.slack_sender = slack_sender or SlackSender()
         self.loader = YFinanceDataLoader()
         self.engine = TechnicalEngine()
 
@@ -237,7 +290,7 @@ class AlertScanner:
         return results
 
     def scan_and_alert(self) -> dict[str, list[Signal]]:
-        """Scan all tickers, format results, and send via Telegram.
+        """Scan all tickers, format results, and send via Telegram & Slack.
 
         Returns:
             Dict mapping ticker -> list of signals.
@@ -247,13 +300,15 @@ class AlertScanner:
 
         # Send summary
         summary = format_summary_report(results, scan_date)
-        self.sender.send(summary)
+        self.telegram_sender.send(summary)
+        self.slack_sender.send(summary)
 
         # Send individual BUY signals
         all_signals = [s for sigs in results.values() for s in sigs]
         if all_signals:
             detail = format_signal_alert(all_signals, scan_date)
-            self.sender.send(detail)
+            self.telegram_sender.send(detail)
+            self.slack_sender.send(detail)
 
         return results
 
