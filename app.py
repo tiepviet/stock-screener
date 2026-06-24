@@ -17,6 +17,7 @@ Features:
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from datetime import datetime, timedelta
 
@@ -37,6 +38,12 @@ from src.stock_screener.backtest import Backtester
 from src.stock_screener.portfolio import PortfolioTracker
 from src.stock_screener.earnings_calendar import EarningsCalendar
 from src.stock_screener.screen_chain import ScreenChainer
+from src.stock_screener.alert import (
+    AlertScanner,
+    TelegramSender,
+    SlackSender,
+    format_signal_alert,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -76,13 +83,22 @@ with st.sidebar:
     hard_stop = st.slider("Hard Stop-Loss (%)", 3.0, 10.0, 7.0, 0.5) / 100
     lookback_days = st.slider("Data Lookback (days)", 90, 730, 365, 30)
 
+    st.markdown("---")
+    st.markdown("### Alert Channels")
+    tg_ok = bool(os.environ.get("TELEGRAM_BOT_TOKEN") and os.environ.get("TELEGRAM_CHAT_ID"))
+    sl_ok = bool(os.environ.get("SLACK_WEBHOOK_URL"))
+    st.markdown(f"- Telegram: {'✅' if tg_ok else '❌'}")
+    st.markdown(f"- Slack: {'✅' if sl_ok else '❌'}")
+    if not tg_ok and not sl_ok:
+        st.caption("Set Streamlit Secrets or .env to enable alerts")
+
 
 # ---------------------------------------------------------------------------
 # Tab layout
 # ---------------------------------------------------------------------------
 
-tab_chart, tab_screen, tab_signals, tab_backtest, tab_portfolio, tab_earnings, tab_chain, tab_guide = st.tabs(
-    ["Chart", "Screener", "Signals", "Backtest", "Portfolio", "Earnings", "Smart Screen", "Chỉ số & Chiến lược"]
+tab_chart, tab_screen, tab_signals, tab_backtest, tab_portfolio, tab_earnings, tab_chain, tab_alerts, tab_guide = st.tabs(
+    ["Chart", "Screener", "Signals", "Backtest", "Portfolio", "Earnings", "Smart Screen", "Alerts", "Chỉ số & Chiến lược"]
 )
 
 
@@ -581,7 +597,92 @@ Pipeline: **Fundamental** (ROE, P/E, P/B, EPS) → **Technical** (SMA200 uptrend
 
 
 # ============================
-# TAB 4: Chỉ số & Chiến lược
+# TAB 8: Alerts
+# ============================
+
+with tab_alerts:
+    st.subheader("Signal Alerts")
+
+    col_a1, col_a2 = st.columns([1, 1])
+
+    with col_a1:
+        st.markdown("### Channels")
+        tg_ok = bool(os.environ.get("TELEGRAM_BOT_TOKEN") and os.environ.get("TELEGRAM_CHAT_ID"))
+        sl_ok = bool(os.environ.get("SLACK_WEBHOOK_URL"))
+        st.markdown(f"- Telegram: **{'Configured ✅' if tg_ok else 'Not set ❌'}**")
+        st.markdown(f"- Slack: **{'Configured ✅' if sl_ok else 'Not set ❌'}**")
+
+        if st.button("Test Telegram", key="test_tg"):
+            sender = TelegramSender()
+            ok = sender.send("<b>Test</b> từ TSE Stock Screener ✅")
+            st.success("Sent ✅") if ok else st.error("Failed ❌")
+
+        if st.button("Test Slack", key="test_slack"):
+            sender = SlackSender()
+            ok = sender.send("*Test* từ TSE Stock Screener ✅")
+            st.success("Sent ✅") if ok else st.error("Failed ❌")
+
+    with col_a2:
+        st.markdown("### Auto-Scan (GitHub Actions)")
+        st.markdown("""
+For daily automated scan, set up **GitHub Actions**:
+
+1. Add these **GitHub Secrets**:
+   - `TELEGRAM_BOT_TOKEN`
+   - `TELEGRAM_CHAT_ID`
+   - `SLACK_WEBHOOK_URL`
+
+2. Push this repo — workflow at `.github/workflows/daily-scan.yml`
+   runs Mon-Fri 15:30 JST automatically.
+        """)
+
+    st.markdown("---")
+    st.markdown("### Manual Scan")
+
+    alert_tickers = st.text_area(
+        "Tickers (one per line)",
+        value="7203\n6758\n9984\n8306\n6501\n7267\n9434\n6861\n8411\n7751",
+        height=120,
+        key="alert_tickers",
+    )
+    alert_lookback = st.slider("Lookback (days)", 90, 730, 365, 30, key="alert_lb")
+
+    if st.button("Scan & Send Alerts", key="run_alerts"):
+        tickers = [t.strip() for t in alert_tickers.strip().splitlines() if t.strip()]
+
+        scanner = AlertScanner(
+            tickers=tickers,
+            lookback_days=alert_lookback,
+        )
+        with st.spinner("Scanning and sending alerts..."):
+            results = scanner.scan_and_alert()
+
+        total_signals = sum(len(v) for v in results.values())
+        tickers_found = [t for t, v in results.items() if v]
+
+        if total_signals == 0:
+            st.info("No signals found.")
+        else:
+            st.success(f"{total_signals} signals from {len(tickers_found)} tickers")
+            for t in tickers_found:
+                for s in results[t]:
+                    st.code(str(s), language=None)
+
+        st.session_state.last_scan_results = results
+        st.toast("Alerts sent!")
+
+    # Show cached last scan if available
+    if "last_scan_results" in st.session_state:
+        with st.expander("Last Scan Results"):
+            for ticker, sigs in st.session_state.last_scan_results.items():
+                if sigs:
+                    st.write(f"**{ticker}**: {len(sigs)} signals")
+                    for s in sigs:
+                        st.code(str(s), language=None)
+
+
+# ============================
+# TAB 9: Chỉ số & Chiến lược
 # ============================
 
 with tab_guide:
