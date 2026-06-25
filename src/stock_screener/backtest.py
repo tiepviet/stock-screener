@@ -190,7 +190,7 @@ class Backtester:
                 if row["High"] >= take_profit_price:
                     open_trade.close(current_date, take_profit_price, "TAKE_PROFIT")
                     open_trade.pnl -= self.commission_pct * open_trade.entry_price * open_trade.shares
-                    capital += open_trade.pnl
+                    capital += (open_trade.entry_price * open_trade.shares) + open_trade.pnl
                     trades.append(open_trade)
                     open_trade = None
 
@@ -198,7 +198,7 @@ class Backtester:
                 elif row["Low"] <= open_trade.stop_loss:
                     open_trade.close(current_date, open_trade.stop_loss, "STOP_LOSS")
                     open_trade.pnl -= self.commission_pct * open_trade.entry_price * open_trade.shares
-                    capital += open_trade.pnl
+                    capital += (open_trade.entry_price * open_trade.shares) + open_trade.pnl
                     trades.append(open_trade)
                     open_trade = None
 
@@ -206,7 +206,7 @@ class Backtester:
                 elif self.max_holding_days > 0 and days_held >= self.max_holding_days:
                     open_trade.close(current_date, float(row["Close"]), "MAX_HOLD")
                     open_trade.pnl -= self.commission_pct * open_trade.entry_price * open_trade.shares
-                    capital += open_trade.pnl
+                    capital += (open_trade.entry_price * open_trade.shares) + open_trade.pnl
                     trades.append(open_trade)
                     open_trade = None
 
@@ -258,7 +258,7 @@ class Backtester:
                 last_date = last_date.to_pydatetime()
             open_trade.close(last_date, float(df["Close"].iloc[-1]), "END_OF_DATA")
             open_trade.pnl -= self.commission_pct * open_trade.entry_price * open_trade.shares
-            capital += open_trade.pnl
+            capital += (open_trade.entry_price * open_trade.shares) + open_trade.pnl
             trades.append(open_trade)
 
         # --- Compute metrics ---

@@ -74,26 +74,41 @@ class EarningsCalendar:
                 return info
 
             # calendar can be a dict or DataFrame depending on yfinance version
+            now = datetime.now()
+            now_date = now.date()
             if isinstance(cal, dict):
                 earn_date = cal.get("Earnings Date")
                 if earn_date:
                     if isinstance(earn_date, list) and len(earn_date) > 0:
-                        info.next_earnings_date = pd.Timestamp(earn_date[0]).to_pydatetime()
+                        for ed in earn_date:
+                            ts = pd.Timestamp(ed).to_pydatetime()
+                            if ts.date() >= now_date:
+                                info.next_earnings_date = ts
+                                break
+                            else:
+                                if info.last_report_date is None or ts > info.last_report_date:
+                                    info.last_report_date = ts
                     elif isinstance(earn_date, (datetime, pd.Timestamp)):
-                        info.next_earnings_date = pd.Timestamp(earn_date).to_pydatetime()
+                        ts = pd.Timestamp(earn_date).to_pydatetime()
+                        if ts.date() >= now_date:
+                            info.next_earnings_date = ts
+                        else:
+                            info.last_report_date = ts
 
                 info.estimated_eps = cal.get("Earnings Average")
                 info.actual_eps = cal.get("Earnings Actual")
 
             elif isinstance(cal, pd.DataFrame):
                 # Find next future earnings date
-                now = datetime.now()
                 for idx in cal.index:
                     try:
                         ed = pd.Timestamp(idx).to_pydatetime()
-                        if ed > now:
+                        if ed.date() >= now_date:
                             info.next_earnings_date = ed
                             break
+                        else:
+                            if info.last_report_date is None or ed > info.last_report_date:
+                                info.last_report_date = ed
                     except Exception:
                         continue
 

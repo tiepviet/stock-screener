@@ -208,6 +208,10 @@ class YFinanceDataLoader(BaseDataLoader):
                 cached_at = datetime.fromisoformat(data.get("_cached_at", ""))
                 if datetime.now() - cached_at < timedelta(hours=self._CACHE_EXPIRY_HOURS):
                     result = {k: v for k, v in data.items() if not k.startswith("_")}
+                    # Normalize legacy unscaled dividend yield from old cache if present
+                    if "dividend_yield" in result and result["dividend_yield"] is not None:
+                        if result["dividend_yield"] > 0.1:  # Old cache had percentage (e.g., 3.72)
+                            result["dividend_yield"] = result["dividend_yield"] / 100.0
                     _fund_cache_mem[ticker] = (cached_at, result)
                     return result
             except Exception:
@@ -255,12 +259,16 @@ class YFinanceDataLoader(BaseDataLoader):
         if info is None:
             result = {k: None for k in ("pe", "pb", "roe", "eps", "dividend_yield", "market_cap", "sector", "industry")}
         else:
+            div_y = info.get("dividendYield")
+            if div_y is not None:
+                div_y = div_y / 100.0
+
             result = {
                 "pe": info.get("trailingPE"),
                 "pb": info.get("priceToBook"),
                 "roe": info.get("returnOnEquity"),
                 "eps": info.get("trailingEps"),
-                "dividend_yield": info.get("dividendYield"),
+                "dividend_yield": div_y,
                 "market_cap": info.get("marketCap"),
                 "sector": info.get("sector"),
                 "industry": info.get("industry"),

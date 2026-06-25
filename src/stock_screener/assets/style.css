@@ -1,0 +1,427 @@
+/* ──────────────────────────────────────────────────────────────────────────
+   TSE Screener - Modern High-Contrast OLED HUD Style Sheet
+   ────────────────────────────────────────────────────────────────────────── */
+
+@import url('https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600;700&family=Fira+Sans:wght@300;400;500;600;700&display=swap');
+
+:root {
+  --color-primary: #0F172A;
+  --color-secondary: #1E293B;
+  --color-cta: #22C55E;
+  --color-background: #020617;
+  --color-text: #F8FAFC;
+  --font-heading: 'Fira Code', monospace;
+  --font-body: 'Fira Sans', sans-serif;
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
+  --shadow-md: 0 4px 6px rgba(0, 0, 0, 0.4);
+  --shadow-lg: 0 10px 15px rgba(0, 0, 0, 0.5);
+  --shadow-xl: 0 20px 25px rgba(0, 0, 0, 0.6);
+}
+
+/* ── Global Layout ── */
+.stApp {
+    background: #020617 !important;
+    font-family: var(--font-body) !important;
+}
+
+/* Header transparent layout to allow collapsedSidebarButton to work */
+.stApp > header {
+    background: transparent !important;
+    pointer-events: none;
+}
+.stApp > header * {
+    pointer-events: auto;
+}
+
+.main > .block-container {
+    padding: 1.5rem 2rem 3rem !important;
+    max-width: 1400px;
+}
+
+/* ── Typography Override ── */
+h1, h2, h3, h4, h5, h6 {
+    font-family: var(--font-heading) !important;
+    letter-spacing: -0.02em !important;
+    color: var(--color-text) !important;
+}
+
+/* ── Login Screen ── */
+.login-wrapper {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    min-height: 85vh;
+    padding: 2rem 1rem;
+}
+
+.login-bg-orb {
+    position: fixed;
+    border-radius: 50%;
+    filter: blur(100px);
+    opacity: 0.08;
+    pointer-events: none;
+    z-index: 0;
+}
+
+.login-bg-orb.orb1 {
+    width: 600px; height: 600px;
+    background: #22C55E;
+    top: -10%; left: -5%;
+}
+
+.login-bg-orb.orb2 {
+    width: 500px; height: 500px;
+    background: #0F172A;
+    bottom: -5%; right: -5%;
+}
+
+.login-card {
+    width: 100%;
+    max-width: 400px;
+    background: rgba(15, 23, 42, 0.85);
+    border: 1px solid rgba(34, 197, 94, 0.25);
+    border-radius: 12px;
+    padding: 2.5rem 2rem 2rem 2rem;
+    position: relative;
+    z-index: 1;
+    box-shadow:
+        0 0 0 1px rgba(34, 197, 94, 0.1),
+        0 20px 40px -10px rgba(0, 0, 0, 0.7);
+}
+
+.login-brand {
+    text-align: center;
+    margin-bottom: 2rem;
+}
+
+.login-brand .logo {
+    width: 56px;
+    height: 56px;
+    margin: 0 auto 16px auto;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 1.75rem;
+    background: #22C55E;
+    border-radius: 10px;
+    box-shadow: 0 4px 15px rgba(34, 197, 94, 0.3);
+}
+
+.login-brand h1 {
+    font-family: var(--font-heading) !important;
+    font-size: 1.5rem;
+    font-weight: 700;
+    color: #f8fafc;
+    margin: 0 0 6px 0;
+}
+
+.login-brand .tag {
+    color: #94a3b8;
+    font-size: 0.85rem;
+    font-weight: 400;
+}
+
+.login-brand .jp {
+    display: inline-block;
+    margin-left: 4px;
+    padding: 1px 6px;
+    background: rgba(34, 197, 94, 0.15);
+    color: #22C55E;
+    font-size: 0.65rem;
+    font-weight: 600;
+    border-radius: 4px;
+    vertical-align: middle;
+}
+
+.login-divider {
+    height: 1px;
+    background: linear-gradient(
+        90deg,
+        transparent 0%,
+        rgba(34, 197, 94, 0.2) 20%,
+        rgba(34, 197, 94, 0.2) 80%,
+        transparent 100%
+    );
+    margin: 0 0 1.5rem 0;
+}
+
+.login-foot {
+    text-align: center;
+    color: #475569;
+    font-size: 0.72rem;
+    margin-top: 1.2rem;
+}
+
+/* ── Login Form Overrides ── */
+.login-card .stForm, .login-card [data-testid="stForm"] {
+    border: none !important;
+    padding: 0 !important;
+    background: transparent !important;
+}
+
+.login-card .stTextInput > div > div > input {
+    background: #020617 !important;
+    border: 1px solid rgba(148, 163, 184, 0.2) !important;
+    border-radius: 8px !important;
+    color: #f8fafc !important;
+    font-family: var(--font-heading) !important;
+}
+
+.login-card .stTextInput > div > div > input:focus {
+    border-color: #22C55E !important;
+    box-shadow: 0 0 0 2px rgba(34, 197, 94, 0.2) !important;
+}
+
+.login-card .stButton > button {
+    width: 100% !important;
+    background: #22C55E !important;
+    color: #ffffff !important;
+    border: none !important;
+    border-radius: 8px !important;
+    font-weight: 600 !important;
+    box-shadow: 0 4px 12px rgba(34, 197, 94, 0.25) !important;
+    transition: all 0.2s !important;
+}
+
+.login-card .stButton > button:hover {
+    transform: translateY(-1px) !important;
+    box-shadow: 0 6px 16px rgba(34, 197, 94, 0.4) !important;
+}
+
+.login-card .stButton > button:active {
+    transform: translateY(0) !important;
+}
+
+.login-card .stTextInput > div > div > input::placeholder {
+    color: #475569 !important;
+}
+
+.login-card label {
+    color: #94a3b8 !important;
+    font-size: 0.78rem !important;
+    font-weight: 500 !important;
+    letter-spacing: 0.02em !important;
+}
+
+.login-card [data-testid="stAlert"] {
+    border-radius: 10px !important;
+    font-size: 0.8rem !important;
+}
+
+/* ── Streamlit UI Elements ── */
+div[data-testid="stVerticalBlock"] > div[data-testid="stVerticalBlock"] {
+    gap: 0.75rem;
+}
+
+.stMetric {
+    background: #0f172a !important;
+    border: 1px solid rgba(34, 197, 94, 0.15) !important;
+    border-radius: 10px !important;
+    padding: 1rem 1.25rem !important;
+}
+
+.stMetric label {
+    font-family: var(--font-body) !important;
+    font-size: 0.75rem !important;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: #94A3B8 !important;
+}
+
+.stMetric [data-testid="stMetricValue"] {
+    font-family: var(--font-heading) !important;
+    font-size: 1.6rem !important;
+    font-weight: 600;
+    color: #F8FAFC !important;
+}
+
+.stMetric [data-testid="stMetricDelta"] {
+    font-family: var(--font-heading) !important;
+}
+
+/* ── DataFrames ── */
+.stDataFrame {
+    border: 1px solid rgba(148, 163, 184, 0.15) !important;
+    border-radius: 8px !important;
+    overflow: hidden;
+}
+
+.stDataFrame [data-testid="StyledDataFrameDataCell"] {
+    font-family: var(--font-heading) !important;
+    font-size: 0.82rem;
+}
+
+/* ── Tabs (Acid Green Accent) ── */
+.stTabs [data-baseweb="tab-list"] {
+    gap: 0.5rem;
+    background: #0f172a !important;
+    border-radius: 10px;
+    padding: 0.35rem 0.5rem;
+    border: 1px solid rgba(148, 163, 184, 0.1);
+    margin-bottom: 1.25rem;
+}
+
+.stTabs [data-baseweb="tab"] {
+    border-radius: 6px;
+    padding: 0.4rem 1rem;
+    font-size: 0.8rem;
+    font-weight: 500;
+    color: #94a3b8 !important;
+    transition: all 0.2s;
+}
+
+.stTabs [data-baseweb="tab"]:hover {
+    background: rgba(34, 197, 94, 0.1) !important;
+    color: #22C55E !important;
+    cursor: pointer;
+}
+
+.stTabs [aria-selected="true"] {
+    background: rgba(34, 197, 94, 0.15) !important;
+    color: #22C55E !important;
+    border-bottom: 2px solid #22C55E !important;
+    font-weight: 600;
+}
+
+/* ── Custom Metric Tile (Bento Style) ── */
+.metric-tile {
+    background: #0f172a;
+    border: 1px solid rgba(148, 163, 184, 0.15);
+    border-radius: 8px;
+    padding: 12px 14px;
+    text-align: center;
+    transition: all 0.2s ease;
+}
+
+.metric-tile:hover {
+    border-color: rgba(34, 197, 94, 0.3);
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+}
+
+.metric-tile .label {
+    font-family: var(--font-body);
+    color: #94a3b8;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    font-weight: 500;
+}
+
+.metric-tile .value {
+    font-family: var(--font-heading);
+    color: #f8fafc;
+    font-size: 20px;
+    font-weight: 600;
+    margin-top: 4px;
+}
+
+.metric-tile.pos .value {
+    color: #22c55e;
+}
+
+.metric-tile.neg .value {
+    color: #ef4444;
+}
+
+.tt-sub {
+    font-family: var(--font-body);
+    font-size: 0.72rem;
+    color: #64748b;
+    margin-top: 2px;
+    line-height: 1.25;
+}
+
+.tt-sub b {
+    font-family: var(--font-heading);
+    color: #cbd5e1;
+    font-weight: 500;
+}
+
+.tt-sub.pos b {
+    color: #22c55e;
+}
+
+.tt-sub.neg b {
+    color: #ef4444;
+}
+
+/* ── General Interactive element styling ── */
+.stSlider div[role="slider"] {
+    background: #22C55E !important;
+}
+
+.stButton > button {
+    cursor: pointer !important;
+    transition: all 0.15s ease !important;
+}
+
+.stButton > button:hover {
+    border-color: #22C55E !important;
+    color: #22C55E !important;
+}
+
+/* ── Hide Streamlit chrome ── */
+#MainMenu, footer, [data-testid="stHeaderActionButton"], [data-testid="stDecoration"] {
+    visibility: hidden;
+    display: none !important;
+}
+
+/* ── Expanders ── */
+.streamlit-expanderHeader {
+    font-weight: 600;
+    font-size: 0.85rem;
+    border-radius: 8px;
+    background: rgba(15, 23, 42, 0.3);
+}
+
+.streamlit-expanderContent {
+    border: 1px solid rgba(148, 163, 184, 0.08);
+    border-radius: 0 0 8px 8px;
+    padding: 0.75rem;
+}
+
+/* ── Profits / Losses ── */
+.profit-text {
+    color: #22C55E !important;
+    font-family: var(--font-heading) !important;
+    font-weight: 600;
+}
+
+.loss-text {
+    color: #ef4444 !important;
+    font-family: var(--font-heading) !important;
+    font-weight: 600;
+}
+
+.neutral-text {
+    color: #94A3B8 !important;
+    font-family: var(--font-heading) !important;
+}
+
+/* ── Sidebar ── */
+section[data-testid="stSidebar"] .stMarkdown {
+    font-size: 0.85rem;
+}
+
+section[data-testid="stSidebar"] hr {
+    margin: 0.75rem 0;
+    border-color: rgba(148, 163, 184, 0.1);
+}
+
+/* ── Info / Success / Warning boxes ── */
+.stAlert {
+    border-radius: 10px;
+    border: none;
+}
+
+/* ── Spinner ── */
+.stSpinner {
+    text-align: center;
+    padding: 2rem;
+}
+
+/* ── Toast ── */
+div[data-testid="stToast"] {
+    border-radius: 10px !important;
+}

@@ -47,6 +47,8 @@ cache/
 *.parquet
 *.csv
 !data/sample/*.csv
+data/
+!data/.gitkeep
 
 # =============================================================================
 # Project: Portfolio (user-specific)

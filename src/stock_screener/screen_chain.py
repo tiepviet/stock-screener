@@ -137,8 +137,12 @@ class ScreenChainer:
                     continue
 
                 # Technical filter: must be above SMA200 (uptrend)
-                last = df.iloc[-1]
-                if pd.isna(last.get("SMA_200")) or last["Close"] < last["SMA_200"]:
+                if "SMA_200" not in df.columns:
+                    logger.debug("%s: SMA_200 not available", ticker)
+                    continue
+                sma200 = df["SMA_200"].iloc[-1]
+                close = df["Close"].iloc[-1]
+                if pd.isna(sma200) or close < sma200:
                     logger.debug("%s: below SMA200 — filtered out", ticker)
                     continue
 
