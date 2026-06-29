@@ -151,6 +151,8 @@ class RiskManager:
         allocated = 0.0
 
         for sig in sorted(signals, key=lambda s: s.price):
+            if sig.signal_type.value != "BUY":
+                continue
             plan = self.calculate_position(sig)
             if plan.shares == 0:
                 continue

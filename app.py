@@ -738,7 +738,8 @@ with tab_signals:
             # Position sizing
             st.subheader("Position Sizing")
             rm = RiskManager(capital, risk_pct, hard_stop)
-            plans = rm.batch_positions(all_signals)
+            buy_signals = [s for s in all_signals if s.signal_type.value == "BUY"]
+            plans = rm.batch_positions(buy_signals)
 
             if plans:
                 plan_df = pd.DataFrame([vars(p) for p in plans])

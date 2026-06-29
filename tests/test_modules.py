@@ -348,3 +348,17 @@ def test_trailing_stop_manager_validates_pct() -> None:
         TrailingStopManager(trail_pct=0)
     with pytest.raises(ValueError):
         TrailingStopManager(trail_pct=1.5)
+
+
+def test_batch_positions_skips_sell_signals() -> None:
+    """batch_positions should skip SELL signals, not crash."""
+    from src.stock_screener.technical_engine import Signal, SignalType
+
+    rm = RiskManager(total_capital=1_000_000)
+    buy = Signal(ticker="7203", signal_type=SignalType.BUY, strategy="test",
+                 date=datetime(2025, 1, 1), price=2500, stop_loss=2300)
+    sell = Signal(ticker="6758", signal_type=SignalType.SELL, strategy="test",
+                  date=datetime(2025, 1, 1), price=12000, stop_loss=13000)
+    plans = rm.batch_positions([buy, sell])
+    assert len(plans) == 1
+    assert plans[0].ticker == "7203"
