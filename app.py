@@ -38,6 +38,7 @@ from src.stock_screener.earnings_calendar import EarningsCalendar
 from src.stock_screener.fundamental_screener import Condition, FundamentalScreener
 from src.stock_screener.multi_timeframe import MultiTimeframeConfirmer
 from src.stock_screener.portfolio import PortfolioTracker
+from src.stock_screener.price_target import PriceTargetEngine
 from src.stock_screener.profit_target import TargetRow, calculate_exit_price, summarize
 from src.stock_screener.risk_management import RiskManager
 from src.stock_screener.screen_chain import ScreenChainer
@@ -475,8 +476,8 @@ with st.sidebar:
 # Tab layout
 # ---------------------------------------------------------------------------
 
-tab_chart, tab_screen, tab_signals, tab_backtest, tab_portfolio, tab_earnings, tab_chain, tab_mtf, tab_target, tab_alerts, tab_guide = st.tabs(
-    ["Chart", "Screener", "Signals", "Backtest", "Portfolio", "Earnings", "Smart Screen", "MTF", "Target", "Alerts", "Guide"]
+tab_chart, tab_screen, tab_signals, tab_backtest, tab_portfolio, tab_earnings, tab_chain, tab_mtf, tab_target, tab_pt, tab_alerts, tab_guide = st.tabs(
+    ["Chart", "Screener", "Signals", "Backtest", "Portfolio", "Earnings", "Smart Screen", "MTF", "Target", "Price Targets", "Alerts", "Guide"]
 )
 
 
@@ -735,10 +736,38 @@ with tab_signals:
             } for s in all_signals])
             st.dataframe(sig_df, width='stretch', hide_index=True)
 
+            # Take-profit targets for BUY signals
+            buy_signals = [s for s in all_signals if s.signal_type.value == "BUY"]
+            if buy_signals:
+                st.subheader("Take-Profit Targets")
+                pte = PriceTargetEngine(swing_lookback=20, atr_period=14, atr_mult=1.5)
+                tp_rows = []
+                for sig in buy_signals[:10]:  # Limit to 10 for performance
+                    try:
+                        sig_df_raw = loader.fetch_ohlcv(sig.ticker, start, end)
+                        sig_df_enriched = engine.enrich(sig_df_raw)
+                        targets = pte.compute_all(
+                            sig_df_enriched, sig.ticker,
+                            entry_price=sig.price, stop_loss=sig.stop_loss,
+                        )
+                        tps = targets.take_profits[:3] if targets.take_profits else []
+                        rr_ratio = targets.risk_reward.ratio if targets.risk_reward else 0
+                        tp_rows.append({
+                            "Ticker": sig.ticker,
+                            "Entry": f"¥{sig.price:,.0f}",
+                            "TP1": f"¥{tps[0]:,.0f}" if len(tps) > 0 else "—",
+                            "TP2": f"¥{tps[1]:,.0f}" if len(tps) > 1 else "—",
+                            "TP3": f"¥{tps[2]:,.0f}" if len(tps) > 2 else "—",
+                            "R:R": f"{rr_ratio:.2f}" if rr_ratio > 0 else "—",
+                        })
+                    except Exception:
+                        pass
+                if tp_rows:
+                    st.dataframe(pd.DataFrame(tp_rows), width='stretch', hide_index=True)
+
             # Position sizing
             st.subheader("Position Sizing")
             rm = RiskManager(capital, risk_pct, hard_stop)
-            buy_signals = [s for s in all_signals if s.signal_type.value == "BUY"]
             plans = rm.batch_positions(buy_signals)
 
             if plans:
@@ -1384,7 +1413,148 @@ with tab_target:
 
 
 # ============================
-# TAB 10: Alerts
+# TAB 10: Price Targets
+# ============================
+
+with tab_pt:
+    st.subheader("Price Targets — Buy & Sell Zones")
+    st.caption("Phân tích vùng mua/bán tiềm năng dựa trên Fibonacci, Support/Resistance, và R:R ratio")
+
+    pt_ticker = st.text_input(
+        "Ticker",
+        value="7203",
+        key="pt_ticker",
+    ).strip().upper()
+
+    col_pt1, col_pt2 = st.columns(2)
+    with col_pt1:
+        pt_lookback = st.slider("Lookback (days)", 90, 730, 365, key="pt_lookback")
+    with col_pt2:
+        pt_entry = st.number_input(
+            "Entry Price (¥) — optional",
+            value=0.0,
+            min_value=0.0,
+            step=10.0,
+            key="pt_entry",
+            help="Để 0 = dùng giá hiện tại",
+        )
+
+    if st.button("Analyze", key="pt_analyze"):
+        if not pt_ticker:
+            st.warning("Nhập mã CK")
+            st.stop()
+
+        with st.spinner(f"Fetching {pt_ticker}..."):
+            end = datetime.now().strftime("%Y-%m-%d")
+            start = (datetime.now() - timedelta(days=pt_lookback)).strftime("%Y-%m-%d")
+            try:
+                df = loader.fetch_ohlcv(pt_ticker, start, end)
+                df = engine.enrich(df)
+            except Exception as e:
+                st.error(f"Failed to fetch {pt_ticker}: {e}")
+                st.stop()
+
+        entry_val = pt_entry if pt_entry > 0 else float(df["Close"].iloc[-1])
+        sl_val = entry_val * 0.93  # 7% hard stop
+
+        pte = PriceTargetEngine(swing_lookback=20, atr_period=14, atr_mult=1.5)
+        targets = pte.compute_all(df, pt_ticker, entry_price=entry_val, stop_loss=sl_val)
+
+        # --- Current Price ---
+        st.metric("Current Price", f"¥{targets.current_price:,.0f}")
+
+        # --- Buy Zone ---
+        if targets.buy_zone:
+            bz = targets.buy_zone
+            st.subheader("🟢 Buy Zone")
+            col_bz1, col_bz2, col_bz3 = st.columns(3)
+            col_bz1.metric("Zone Low", f"¥{bz.zone_low:,.0f}")
+            col_bz2.metric("Zone High", f"¥{bz.zone_high:,.0f}")
+            col_bz3.metric("Suggested Entry", f"¥{bz.entry_suggestion:,.0f}")
+
+            if bz.support_levels:
+                st.caption(f"Support levels: {', '.join(f'¥{s:,.0f}' for s in bz.support_levels)}")
+            st.caption(bz.reasoning)
+
+        # --- Sell Zone ---
+        if targets.sell_zone:
+            sz = targets.sell_zone
+            st.subheader("🔴 Sell Zone")
+            col_sz1, col_sz2, col_sz3 = st.columns(3)
+            col_sz1.metric("Zone Low", f"¥{sz.zone_low:,.0f}")
+            col_sz2.metric("Zone High", f"¥{sz.zone_high:,.0f}")
+            col_sz3.metric("Suggested Exit", f"¥{sz.exit_suggestion:,.0f}")
+
+            if sz.resistance_levels:
+                st.caption(f"Resistance levels: {', '.join(f'¥{r:,.0f}' for r in sz.resistance_levels)}")
+            if sz.take_profits:
+                st.caption(f"Take-profit targets: {', '.join(f'¥{t:,.0f}' for t in sz.take_profits)}")
+            st.caption(sz.reasoning)
+
+        # --- Risk/Reward ---
+        if targets.risk_reward:
+            rr = targets.risk_reward
+            st.subheader("📐 Risk / Reward")
+            col_rr1, col_rr2, col_rr3 = st.columns(3)
+            col_rr1.metric("Risk (¥)", f"¥{rr.risk:,.0f}")
+            col_rr2.metric("Reward (¥)", f"¥{rr.reward:,.0f}")
+            col_rr3.metric("R:R Ratio", f"{rr.ratio:.2f}")
+
+            if rr.ratio >= 2.0:
+                st.success(f"R:R = {rr.ratio:.2f} — Favorable")
+            elif rr.ratio >= 1.0:
+                st.warning(f"R:R = {rr.ratio:.2f} — Acceptable")
+            else:
+                st.error(f"R:R = {rr.ratio:.2f} — Unfavorable")
+
+        # --- Fibonacci Levels ---
+        if targets.fibonacci:
+            fib = targets.fibonacci
+            st.subheader("📊 Fibonacci Levels")
+            col_f1, col_f2 = st.columns(2)
+
+            with col_f1:
+                st.markdown("**Retracement**")
+                for label, level in fib.retracements.items():
+                    st.text(f"  {label}: ¥{level:,.0f}")
+
+            with col_f2:
+                st.markdown("**Extension**")
+                for label, level in fib.extensions.items():
+                    st.text(f"  {label}: ¥{level:,.0f}")
+
+        # --- Support/Resistance ---
+        if targets.sr:
+            sr = targets.sr
+            st.subheader("📈 Support / Resistance")
+            col_sr1, col_sr2 = st.columns(2)
+
+            with col_sr1:
+                st.markdown("**Support**")
+                if sr.supports:
+                    for s in sr.supports:
+                        st.text(f"  ¥{s:,.0f}")
+                else:
+                    st.text("  None found")
+
+            with col_sr2:
+                st.markdown("**Resistance**")
+                if sr.resistances:
+                    for r in sr.resistances:
+                        st.text(f"  ¥{r:,.0f}")
+                else:
+                    st.text("  None found")
+
+        # --- Take-Profit Levels ---
+        if targets.take_profits:
+            st.subheader("🎯 Take-Profit Levels")
+            for i, tp in enumerate(targets.take_profits, 1):
+                pct_gain = (tp - targets.current_price) / targets.current_price * 100
+                st.text(f"  TP{i}: ¥{tp:,.0f} (+{pct_gain:.1f}%)")
+
+
+# ============================
+# TAB 11: Alerts
 # ============================
 
 with tab_alerts:

@@ -18,6 +18,15 @@ from .fundamental_screener import (
 )
 from .multi_timeframe import ConfirmedSignal, MultiTimeframeConfirmer
 from .portfolio import PortfolioPosition, PortfolioTracker
+from .price_target import (
+    BuyZone,
+    FibonacciLevels,
+    PriceTargetEngine,
+    PriceTargets,
+    RiskReward,
+    SellZone,
+    SupportResistance,
+)
 from .risk_management import PositionPlan, RiskManager, TrailingStopManager, TrailingStopState
 from .screen_chain import ScoredStock, ScreenChainer
 from .technical_engine import (
@@ -36,22 +45,29 @@ __all__ = [
     "BacktestResult",
     "BaseDataLoader",
     "BaseStrategy",
+    "BuyZone",
     "Condition",
     "ConfirmedSignal",
     "EarningsCalendar",
     "EarningsInfo",
+    "FibonacciLevels",
     "FundamentalScreener",
     "MultiTimeframeConfirmer",
     "OverboughtReversalSellStrategy",
     "PortfolioPosition",
     "PortfolioTracker",
     "PositionPlan",
+    "PriceTargets",
+    "PriceTargetEngine",
     "PullbackMAStrategy",
     "RiskManager",
+    "RiskReward",
     "ScoredStock",
     "ScreenChainer",
+    "SellZone",
     "Signal",
     "SignalType",
+    "SupportResistance",
     "TechnicalEngine",
     "TrailingStopManager",
     "TrailingStopState",
