@@ -18,14 +18,16 @@ from .fundamental_screener import (
 )
 from .multi_timeframe import ConfirmedSignal, MultiTimeframeConfirmer
 from .portfolio import PortfolioPosition, PortfolioTracker
-from .risk_management import PositionPlan, RiskManager
+from .risk_management import PositionPlan, RiskManager, TrailingStopManager, TrailingStopState
 from .screen_chain import ScoredStock, ScreenChainer
 from .technical_engine import (
     BaseStrategy,
+    OverboughtReversalSellStrategy,
     PullbackMAStrategy,
     Signal,
     SignalType,
     TechnicalEngine,
+    TrendBreakdownSellStrategy,
     VolumeBreakoutStrategy,
 )
 
@@ -40,6 +42,7 @@ __all__ = [
     "EarningsInfo",
     "FundamentalScreener",
     "MultiTimeframeConfirmer",
+    "OverboughtReversalSellStrategy",
     "PortfolioPosition",
     "PortfolioTracker",
     "PositionPlan",
@@ -50,6 +53,9 @@ __all__ = [
     "Signal",
     "SignalType",
     "TechnicalEngine",
+    "TrailingStopManager",
+    "TrailingStopState",
+    "TrendBreakdownSellStrategy",
     "Trade",
     "VolumeBreakoutStrategy",
     "YFinanceDataLoader",

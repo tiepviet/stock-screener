@@ -10,6 +10,7 @@ Schema is created on first import via `init_db()`.
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import threading
 from collections.abc import Iterator
@@ -18,8 +19,19 @@ from pathlib import Path
 
 # Project root: src/stock_screener/db.py -> ../../
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-DATA_DIR = PROJECT_ROOT / "data"
-DB_PATH = DATA_DIR / "screener.db"
+
+# Allow overriding data directory and database path via environment variables
+env_data_dir = os.environ.get("TSE_DATA_DIR")
+if env_data_dir:
+    DATA_DIR = Path(env_data_dir).resolve()
+else:
+    DATA_DIR = PROJECT_ROOT / "data"
+
+env_db_path = os.environ.get("TSE_DB_PATH")
+if env_db_path:
+    DB_PATH = Path(env_db_path).resolve()
+else:
+    DB_PATH = DATA_DIR / "screener.db"
 
 # Single-process: Streamlit runs one Python process per session.
 # A re-entrant lock keeps concurrent threads (Streamlit script runner

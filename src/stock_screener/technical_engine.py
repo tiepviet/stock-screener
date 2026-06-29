@@ -15,7 +15,7 @@ from datetime import datetime
 from enum import Enum
 
 import pandas as pd
-import pandas_ta as ta
+import pandas_ta_classic as ta
 
 logger = logging.getLogger(__name__)
 
@@ -351,4 +351,177 @@ class PullbackMAStrategy(BaseStrategy):
                         )
                     )
                     break  # one signal per bar
+        return signals
+
+
+# ---------------------------------------------------------------------------
+# Sell strategies
+# ---------------------------------------------------------------------------
+
+
+class TrendBreakdownSellStrategy(BaseStrategy):
+    """Sell when price breaks down below key MA support on volume.
+
+    Conditions:
+      1. Previous Close >= SMA_20 (was above support).
+      2. Current Close < SMA_20 (broke below support).
+      3. Close < SMA_50 (confirms weakness beyond short-term).
+      4. Volume > volume_mult * SMA(Volume, 20) (selling pressure).
+    """
+
+    name = "TrendBreakdown"
+
+    def __init__(
+        self,
+        breakdown_ma: int = 20,
+        confirm_ma: int = 50,
+        volume_mult: float = 1.2,
+        vol_sma_period: int = 20,
+    ) -> None:
+        self.breakdown_ma = breakdown_ma
+        self.confirm_ma = confirm_ma
+        self.volume_mult = volume_mult
+        self.vol_sma_period = vol_sma_period
+
+    def generate_signals(self, df: pd.DataFrame, ticker: str) -> list[Signal]:
+        signals: list[Signal] = []
+        breakdown_col = f"SMA_{self.breakdown_ma}"
+        confirm_col = f"SMA_{self.confirm_ma}"
+        vol_sma_col = f"VOL_SMA_{self.vol_sma_period}"
+
+        required = {"Close", "Volume", breakdown_col, confirm_col, vol_sma_col}
+        if not required.issubset(df.columns):
+            logger.debug("TrendBreakdown skip %s: missing %s", ticker, required - set(df.columns))
+            return signals
+        if df.empty or len(df) < 2:
+            logger.debug("TrendBreakdown skip %s: insufficient rows (%d)", ticker, len(df))
+            return signals
+
+        for i in range(1, len(df)):
+            row = df.iloc[i]
+            prev = df.iloc[i - 1]
+
+            prev_close = prev["Close"]
+            curr_close = row["Close"]
+            prev_ma = prev[breakdown_col]
+            curr_ma = row[breakdown_col]
+            confirm = row[confirm_col]
+
+            if pd.isna(prev_ma) or pd.isna(curr_ma) or pd.isna(confirm):
+                continue
+
+            # 1. Was above breakdown MA, now below
+            if not (prev_close >= prev_ma and curr_close < curr_ma):
+                continue
+            # 2. Below confirm MA
+            if curr_close >= confirm:
+                continue
+            # 3. Volume surge
+            vol_sma = row[vol_sma_col]
+            if pd.isna(vol_sma) or vol_sma == 0:
+                continue
+            if row["Volume"] < self.volume_mult * vol_sma:
+                continue
+
+            price = float(curr_close)
+            atr_raw = row.get("ATR_14")
+            atr_val = float(atr_raw) if atr_raw is not None and not pd.isna(atr_raw) else 0.0
+            # For sell: stop loss is ABOVE entry (cap loss if reversal)
+            sl = round(price + 2 * atr_val, 2) if atr_val > 0 else None
+
+            signals.append(
+                Signal(
+                    ticker=ticker,
+                    signal_type=SignalType.SELL,
+                    strategy=self.name,
+                    date=df.index[i].to_pydatetime() if hasattr(df.index[i], "to_pydatetime") else df.index[i],
+                    price=price,
+                    stop_loss=sl,
+                    metadata={
+                        "breakdown_ma": self.breakdown_ma,
+                        "confirm_ma": self.confirm_ma,
+                        "volume_ratio": round(row["Volume"] / vol_sma, 2),
+                    },
+                )
+            )
+        return signals
+
+
+class OverboughtReversalSellStrategy(BaseStrategy):
+    """Sell when RSI is overbought and price shows reversal.
+
+    Conditions:
+      1. Previous RSI >= rsi_overbought (was overbought).
+      2. Current RSI < rsi_overbought (dropping from overbought).
+      3. Current Close < Previous Close (price declining).
+      4. Close < SMA_20 (below short-term trend).
+    """
+
+    name = "OverboughtReversal"
+
+    def __init__(
+        self,
+        rsi_overbought: float = 70.0,
+        trend_ma: int = 20,
+        rsi_col: str = "RSI_14",
+    ) -> None:
+        self.rsi_overbought = rsi_overbought
+        self.trend_ma = trend_ma
+        self.rsi_col = rsi_col
+
+    def generate_signals(self, df: pd.DataFrame, ticker: str) -> list[Signal]:
+        signals: list[Signal] = []
+        trend_col = f"SMA_{self.trend_ma}"
+
+        required = {"Close", self.rsi_col, trend_col}
+        if not required.issubset(df.columns):
+            logger.debug("OverboughtReversal skip %s: missing %s", ticker, required - set(df.columns))
+            return signals
+        if df.empty or len(df) < 2:
+            logger.debug("OverboughtReversal skip %s: insufficient rows (%d)", ticker, len(df))
+            return signals
+
+        for i in range(1, len(df)):
+            row = df.iloc[i]
+            prev = df.iloc[i - 1]
+
+            prev_rsi = prev[self.rsi_col]
+            curr_rsi = row[self.rsi_col]
+            prev_close = prev["Close"]
+            curr_close = row["Close"]
+            trend = row[trend_col]
+
+            if pd.isna(prev_rsi) or pd.isna(curr_rsi) or pd.isna(trend):
+                continue
+
+            # 1. Was overbought, now dropping
+            if not (prev_rsi >= self.rsi_overbought and curr_rsi < self.rsi_overbought):
+                continue
+            # 2. Price declining
+            if curr_close >= prev_close:
+                continue
+            # 3. Below trend MA
+            if curr_close >= trend:
+                continue
+
+            price = float(curr_close)
+            atr_raw = row.get("ATR_14")
+            atr_val = float(atr_raw) if atr_raw is not None and not pd.isna(atr_raw) else 0.0
+            sl = round(price + 2 * atr_val, 2) if atr_val > 0 else None
+
+            signals.append(
+                Signal(
+                    ticker=ticker,
+                    signal_type=SignalType.SELL,
+                    strategy=self.name,
+                    date=df.index[i].to_pydatetime() if hasattr(df.index[i], "to_pydatetime") else df.index[i],
+                    price=price,
+                    stop_loss=sl,
+                    metadata={
+                        "rsi_prev": round(float(prev_rsi), 2),
+                        "rsi_curr": round(float(curr_rsi), 2),
+                        "trend_ma": self.trend_ma,
+                    },
+                )
+            )
         return signals

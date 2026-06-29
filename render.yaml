@@ -1,0 +1,28 @@
+services:
+  - type: web
+    name: stock-screener
+    env: python
+    # Standard build command to install dependencies
+    buildCommand: pip install -r requirements.txt
+    # Start command for Streamlit
+    startCommand: streamlit run app.py --server.port $PORT --server.address 0.0.0.0
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.10.12
+      - key: TSE_ADMIN_USER
+        sync: true
+      - key: TSE_ADMIN_PASSWORD
+        sync: true
+      - key: TSE_JWT_SECRET
+        generateValue: true
+      # By default, use local ephemeral data dir. 
+      # Set to /data if a persistent disk is attached.
+      - key: TSE_DATA_DIR
+        value: ./data
+
+    # Optional: Uncomment if deploying on Render Paid tier (Starter or higher) 
+    # to persist SQLite database. Free tier does not support persistent disks.
+    # disk:
+    #   name: screener-data
+    #   mountPath: /data
+    #   sizeGB: 1

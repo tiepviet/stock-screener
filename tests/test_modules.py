@@ -80,6 +80,15 @@ def test_risk_manager_check_stop_loss_triggered() -> None:
     assert rm.check_stop_loss(plan, current_price=950) is None
 
 
+def test_risk_manager_zero_risk_per_share_returns_zero_shares() -> None:
+    """When entry == stop_loss, risk_per_share=0, should return shares=0."""
+    rm = RiskManager(total_capital=1_000_000)
+    plan = rm.calculate_position(_buy_signal(price=1000, sl=1000))
+    assert plan.shares == 0
+    assert plan.risk_amount == 0.0
+    assert plan.position_value == 0.0
+
+
 # --- backtest ---
 
 
@@ -273,3 +282,69 @@ def test_screen_chain_missing_data_defaults_to_zero() -> None:
     chainer = ScreenChainer()
     s = chainer._compute_fundamental_score({})
     assert all(v == 0 for v in s.values())
+
+
+# --- trailing stop ---
+
+
+def test_trailing_stop_manager_update_moves_stop_up() -> None:
+    from src.stock_screener.risk_management import TrailingStopManager
+
+    mgr = TrailingStopManager(trail_pct=0.05)
+    mgr.open("7203", entry_price=1000, initial_stop=950)
+    # Price rises → stop should move up
+    new_stop = mgr.update("7203", current_price=1050)
+    assert new_stop is not None
+    assert new_stop > 950  # stop moved up
+    assert new_stop == round(1050 * 0.95, 2)  # 997.5
+
+
+def test_trailing_stop_manager_stop_does_not_move_down() -> None:
+    from src.stock_screener.risk_management import TrailingStopManager
+
+    mgr = TrailingStopManager(trail_pct=0.05)
+    mgr.open("7203", entry_price=1000, initial_stop=950)
+    mgr.update("7203", current_price=1050)  # stop moves to 997.5
+    new_stop = mgr.update("7203", current_price=1020)  # price drops
+    assert new_stop == 997.5  # stop stays
+
+
+def test_trailing_stop_manager_check_exit() -> None:
+    from src.stock_screener.risk_management import TrailingStopManager
+
+    mgr = TrailingStopManager(trail_pct=0.05)
+    mgr.open("7203", entry_price=1000, initial_stop=950)
+    mgr.update("7203", current_price=1050)
+    # Price drops below trailing stop
+    assert mgr.check_exit("7203", current_price=990) == "TRAILING_STOP"
+    assert mgr.check_exit("7203", current_price=1000) is None
+
+
+def test_trailing_stop_manager_close_removes_position() -> None:
+    from src.stock_screener.risk_management import TrailingStopManager
+
+    mgr = TrailingStopManager(trail_pct=0.05)
+    mgr.open("7203", entry_price=1000)
+    closed = mgr.close("7203")
+    assert closed is not None
+    assert mgr.get_state("7203") is None
+
+
+def test_trailing_stop_manager_active_positions() -> None:
+    from src.stock_screener.risk_management import TrailingStopManager
+
+    mgr = TrailingStopManager(trail_pct=0.05)
+    mgr.open("7203", entry_price=1000)
+    mgr.open("6758", entry_price=2000)
+    assert set(mgr.active_positions) == {"7203", "6758"}
+    mgr.close("7203")
+    assert mgr.active_positions == ["6758"]
+
+
+def test_trailing_stop_manager_validates_pct() -> None:
+    from src.stock_screener.risk_management import TrailingStopManager
+
+    with pytest.raises(ValueError):
+        TrailingStopManager(trail_pct=0)
+    with pytest.raises(ValueError):
+        TrailingStopManager(trail_pct=1.5)

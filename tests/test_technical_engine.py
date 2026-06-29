@@ -4,10 +4,12 @@ from __future__ import annotations
 import pandas as pd
 
 from src.stock_screener.technical_engine import (
+    OverboughtReversalSellStrategy,
     PullbackMAStrategy,
     Signal,
     SignalType,
     TechnicalEngine,
+    TrendBreakdownSellStrategy,
     VolumeBreakoutStrategy,
 )
 
@@ -81,4 +83,42 @@ def test_signal_str_repr_includes_ticker() -> None:
 def test_pullback_ma_handles_missing_columns() -> None:
     df = pd.DataFrame({"Close": [1, 2, 3]})
     sigs = PullbackMAStrategy().generate_signals(df, "X")
+    assert sigs == []
+
+
+# --- Sell strategies ---
+
+
+def test_trend_breakdown_emits_sell_signal(synthetic_ohlcv: pd.DataFrame) -> None:
+    df = TechnicalEngine().enrich(synthetic_ohlcv)
+    # Simulate breakdown: prev close above SMA_20, current below, with volume surge
+    idx = len(df) - 1
+    df.loc[df.index[idx - 1], "Close"] = df["SMA_20"].iloc[idx - 1] * 1.1  # above
+    df.loc[df.index[idx], "Close"] = df["SMA_20"].iloc[idx] * 0.85  # below
+    df.loc[df.index[idx], "Volume"] = df["VOL_SMA_20"].iloc[idx] * 3  # surge
+    sigs = TrendBreakdownSellStrategy().generate_signals(df, "TEST")
+    assert any(s.signal_type == SignalType.SELL for s in sigs)
+
+
+def test_trend_breakdown_handles_missing_columns() -> None:
+    df = pd.DataFrame({"Close": [1, 2, 3]})
+    sigs = TrendBreakdownSellStrategy().generate_signals(df, "X")
+    assert sigs == []
+
+
+def test_overbought_reversal_emits_sell_signal(synthetic_ohlcv: pd.DataFrame) -> None:
+    df = TechnicalEngine().enrich(synthetic_ohlcv)
+    # Simulate overbought reversal: RSI dropping from >70, price declining, below SMA_20
+    idx = len(df) - 1
+    df.loc[df.index[idx - 1], "RSI_14"] = 75.0  # overbought
+    df.loc[df.index[idx], "RSI_14"] = 65.0  # dropping
+    df.loc[df.index[idx - 1], "Close"] = df["SMA_20"].iloc[idx - 1] * 1.05
+    df.loc[df.index[idx], "Close"] = df["SMA_20"].iloc[idx] * 0.92  # below + declining
+    sigs = OverboughtReversalSellStrategy().generate_signals(df, "TEST")
+    assert any(s.signal_type == SignalType.SELL for s in sigs)
+
+
+def test_overbought_reversal_handles_missing_columns() -> None:
+    df = pd.DataFrame({"Close": [1, 2, 3]})
+    sigs = OverboughtReversalSellStrategy().generate_signals(df, "X")
     assert sigs == []

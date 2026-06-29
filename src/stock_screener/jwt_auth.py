@@ -21,6 +21,7 @@ Security notes:
 from __future__ import annotations
 
 import logging
+import os
 import secrets
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -39,6 +40,9 @@ _TOKEN_DAYS = 30
 
 def _load_or_create_secret(path: Path | None = None) -> str:
     """Return the JWT signing secret, creating it on first use."""
+    env_secret = os.environ.get("TSE_JWT_SECRET")
+    if env_secret:
+        return env_secret
     p = path or _SECRET_PATH
     if p.exists():
         return p.read_text().strip()

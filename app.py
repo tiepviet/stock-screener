@@ -16,6 +16,7 @@ Features:
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sys
@@ -41,8 +42,10 @@ from src.stock_screener.profit_target import TargetRow, calculate_exit_price, su
 from src.stock_screener.risk_management import RiskManager
 from src.stock_screener.screen_chain import ScreenChainer
 from src.stock_screener.technical_engine import (
+    OverboughtReversalSellStrategy,
     PullbackMAStrategy,
     TechnicalEngine,
+    TrendBreakdownSellStrategy,
     VolumeBreakoutStrategy,
 )
 
@@ -73,12 +76,12 @@ def load_global_css() -> None:
         "style.css",
     )
     if os.path.exists(css_path):
-        with open(css_path, "r", encoding="utf-8") as f:
+        with open(css_path, encoding="utf-8") as f:
             st.markdown(f"<style>{f.read()}</style>", unsafe_allow_html=True)
     else:
         fallback_path = "src/stock_screener/assets/style.css"
         if os.path.exists(fallback_path):
-            with open(fallback_path, "r", encoding="utf-8") as f:
+            with open(fallback_path, encoding="utf-8") as f:
                 st.markdown(f"<style>{f.read()}</style>", unsafe_allow_html=True)
 
 load_global_css()
@@ -127,8 +130,9 @@ if st.session_state.auth_user is None:
 def _issue_token_and_login(rec: auth.UserRecord) -> None:
     """Store JWT in localStorage and mark session as authenticated."""
     token = jwt_auth.create_token(rec.id, rec.username)
+    safe_token = json.dumps(token)
     streamlit_js_eval(
-        js_expressions=f"localStorage.setItem('tse_jwt', '{token}')",
+        js_expressions=f"localStorage.setItem('tse_jwt', {safe_token})",
         key="_jwt_issue",
     )
     st.session_state.auth_user = rec
@@ -290,6 +294,26 @@ st.title("Tokyo Stock Exchange — Screener & Signal Dashboard")
 loader = YFinanceDataLoader()
 engine = TechnicalEngine()
 
+
+def safe_fetch_ohlcv(
+    ticker: str,
+    start: str,
+    end: str,
+    interval: str = "1d",
+) -> pd.DataFrame | None:
+    """Fetch OHLCV with user-friendly error handling.
+
+    Returns DataFrame on success, None on failure (with st.error message).
+    """
+    try:
+        return loader.fetch_ohlcv(ticker, start, end, interval)
+    except ValueError as e:
+        st.error(f"No data for {ticker}: {e}")
+        return None
+    except Exception as e:
+        st.error(f"Failed to fetch {ticker}: {type(e).__name__}: {e}")
+        return None
+
 # ---------------------------------------------------------------------------
 # Background auto-scan thread
 # ---------------------------------------------------------------------------
@@ -299,10 +323,10 @@ _auto_scan_stop = threading.Event()
 _auto_scan_last: str = ""
 _auto_scan_lock = threading.Lock()
 
-DEFAULT_ALERT_TICKERS = [
-    "7203", "6758", "9984", "8306", "6501",
-    "7267", "9434", "6861", "8411", "7751",
-]
+DEFAULT_TICKERS_5 = ["7203", "6758", "9984", "8306", "6501"]
+DEFAULT_TICKERS_10 = DEFAULT_TICKERS_5 + ["7267", "9434", "6861", "8411", "7751"]
+DEFAULT_TICKERS_15 = DEFAULT_TICKERS_10 + ["6752", "7974", "6178", "8316", "9831"]
+DEFAULT_ALERT_TICKERS = DEFAULT_TICKERS_10
 
 
 def _auto_scan_worker(
@@ -487,16 +511,14 @@ with tab_chart:
         if should_load:
             end = datetime.now().strftime("%Y-%m-%d")
             start = (datetime.now() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
-            try:
-                df = loader.fetch_ohlcv(chart_ticker, start, end, chart_interval)
+            df = safe_fetch_ohlcv(chart_ticker, start, end, chart_interval)
+            if df is not None:
                 df = engine.enrich(df)
                 st.session_state.chart_df = df
                 st.session_state.loaded_ticker = chart_ticker
                 st.session_state.loaded_interval = chart_interval
                 st.session_state.loaded_lookback = lookback_days
-            except Exception as e:
-                st.error(f"Error loading data: {e}")
-                logger.exception("Chart load failed")
+            else:
                 st.session_state.chart_df = None
 
         df = st.session_state.get("chart_df")
@@ -587,7 +609,7 @@ with tab_screen:
 
     tickers_input = st.text_area(
         "Tickers (one per line)",
-        value="7203\n6758\n9984\n8306\n6501\n7267\n9434\n6861\n8411\n7751",
+        value="\n".join(DEFAULT_TICKERS_10),
         height=200,
     )
 
@@ -638,7 +660,7 @@ with tab_signals:
 
     scan_tickers_input = st.text_area(
         "Tickers to Scan (one per line)",
-        value="7203\n6758\n9984\n8306\n6501",
+        value="\n".join(DEFAULT_TICKERS_5),
         height=150,
         key="scan_tickers",
     )
@@ -656,6 +678,8 @@ with tab_signals:
             lookback=vb_lookback, volume_mult=vb_vol_mult
         )
         pm_strategy = PullbackMAStrategy(rsi_max=pm_rsi_max)
+        td_strategy = TrendBreakdownSellStrategy()
+        ob_strategy = OverboughtReversalSellStrategy()
 
         all_signals = []
         progress = st.progress(0)
@@ -668,6 +692,8 @@ with tab_signals:
                 sigs = []
                 sigs.extend(vb_strategy.generate_signals(df, ticker))
                 sigs.extend(pm_strategy.generate_signals(df, ticker))
+                sigs.extend(td_strategy.generate_signals(df, ticker))
+                sigs.extend(ob_strategy.generate_signals(df, ticker))
                 return sigs
             except Exception as e:
                 return [("error", ticker, str(e))]
@@ -985,7 +1011,7 @@ with tab_earnings:
 
     earn_tickers = st.text_area(
         "Tickers to Check",
-        value="7203\n6758\n9984\n8306\n6501",
+        value="\n".join(DEFAULT_TICKERS_5),
         height=150,
         key="earn_tickers",
     )
@@ -1035,7 +1061,7 @@ Pipeline: **Fundamental** (ROE, P/E, P/B, EPS) → **Technical** (SMA200 uptrend
 
     chain_tickers = st.text_area(
         "Ticker Universe",
-        value="7203\n6758\n9984\n8306\n6501\n7267\n9434\n6861\n8411\n7751\n6752\n7974\n6178\n8316\n9831",
+        value="\n".join(DEFAULT_TICKERS_15),
         height=200,
         key="chain_tickers",
     )
@@ -1092,7 +1118,7 @@ with tab_mtf:
 
     mtf_tickers = st.text_area(
         "Tickers (one per line)",
-        value="7203\n6758\n9984\n8306\n6501",
+        value="\n".join(DEFAULT_TICKERS_5),
         height=150,
         key="mtf_tickers",
     )
@@ -1401,7 +1427,7 @@ For daily automated scan, set up **GitHub Actions**:
 
     alert_tickers = st.text_area(
         "Tickers (one per line)",
-        value="7203\n6758\n9984\n8306\n6501\n7267\n9434\n6861\n8411\n7751",
+        value="\n".join(DEFAULT_TICKERS_10),
         height=120,
         key="alert_tickers",
     )

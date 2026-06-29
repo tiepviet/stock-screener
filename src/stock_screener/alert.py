@@ -23,10 +23,12 @@ import requests
 from .data_loader import YFinanceDataLoader
 from .technical_engine import (
     BaseStrategy,
+    OverboughtReversalSellStrategy,
     PullbackMAStrategy,
     Signal,
     SignalType,
     TechnicalEngine,
+    TrendBreakdownSellStrategy,
     VolumeBreakoutStrategy,
 )
 
@@ -256,6 +258,8 @@ class AlertScanner:
         self.strategies = strategies or [
             VolumeBreakoutStrategy(),
             PullbackMAStrategy(),
+            TrendBreakdownSellStrategy(),
+            OverboughtReversalSellStrategy(),
         ]
         self.telegram_sender = telegram_sender or TelegramSender()
         self.slack_sender = slack_sender or SlackSender()

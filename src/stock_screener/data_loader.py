@@ -208,10 +208,9 @@ class YFinanceDataLoader(BaseDataLoader):
                 cached_at = datetime.fromisoformat(data.get("_cached_at", ""))
                 if datetime.now() - cached_at < timedelta(hours=self._CACHE_EXPIRY_HOURS):
                     result = {k: v for k, v in data.items() if not k.startswith("_")}
-                    # Normalize legacy unscaled dividend yield from old cache if present
-                    if "dividend_yield" in result and result["dividend_yield"] is not None:
-                        if result["dividend_yield"] > 0.1:  # Old cache had percentage (e.g., 3.72)
-                            result["dividend_yield"] = result["dividend_yield"] / 100.0
+                    # Fix legacy cache: old format stored dividend_yield as percentage (e.g. 3.72)
+                    if result.get("dividend_yield") is not None and result["dividend_yield"] > 0.1:
+                        result["dividend_yield"] = result["dividend_yield"] / 100.0
                     _fund_cache_mem[ticker] = (cached_at, result)
                     return result
             except Exception:
@@ -259,16 +258,12 @@ class YFinanceDataLoader(BaseDataLoader):
         if info is None:
             result = {k: None for k in ("pe", "pb", "roe", "eps", "dividend_yield", "market_cap", "sector", "industry")}
         else:
-            div_y = info.get("dividendYield")
-            if div_y is not None:
-                div_y = div_y / 100.0
-
             result = {
                 "pe": info.get("trailingPE"),
                 "pb": info.get("priceToBook"),
                 "roe": info.get("returnOnEquity"),
                 "eps": info.get("trailingEps"),
-                "dividend_yield": div_y,
+                "dividend_yield": info.get("dividendYield"),
                 "market_cap": info.get("marketCap"),
                 "sector": info.get("sector"),
                 "industry": info.get("industry"),
@@ -278,7 +273,7 @@ class YFinanceDataLoader(BaseDataLoader):
         return result
 
     def fetch_batch_fundamentals(self, tickers: list[str]) -> dict[str, dict[str, Any]]:
-        """Fetch fundamentals for multiple tickers (uses cache).
+        """Fetch fundamentals for multiple tickers in parallel (uses cache).
 
         Args:
             tickers: List of raw ticker strings.
@@ -286,7 +281,16 @@ class YFinanceDataLoader(BaseDataLoader):
         Returns:
             Dict mapping raw ticker -> fundamentals dict.
         """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
         results: dict[str, dict[str, Any]] = {}
-        for t in tickers:
-            results[t] = self.fetch_fundamentals(t)
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            futures = {executor.submit(self.fetch_fundamentals, t): t for t in tickers}
+            for future in as_completed(futures):
+                ticker = futures[future]
+                try:
+                    results[ticker] = future.result()
+                except Exception:
+                    logger.exception("Batch fetch failed for %s", ticker)
+                    results[ticker] = {k: None for k in ("pe", "pb", "roe", "eps", "dividend_yield", "market_cap", "sector", "industry")}
         return results
