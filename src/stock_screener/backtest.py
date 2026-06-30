@@ -68,6 +68,7 @@ class BacktestResult:
     total_trades: int
     winning_trades: int
     losing_trades: int
+    losing_rate: float
     win_rate: float
     avg_win: float
     avg_loss: float
@@ -287,6 +288,7 @@ class Backtester:
         losers = [t for t in trades if t.pnl <= 0]
 
         win_rate = len(winners) / total if total > 0 else 0
+        losing_rate = len(losers) / total if total > 0 else 0
         avg_win = np.mean([t.pnl_pct for t in winners]) if winners else 0
         avg_loss = np.mean([t.pnl_pct for t in losers]) if losers else 0
 
@@ -330,6 +332,7 @@ class Backtester:
             winning_trades=len(winners),
             losing_trades=len(losers),
             win_rate=round(win_rate, 4),
+            losing_rate=round(losing_rate, 4),
             avg_win=round(float(avg_win), 4),
             avg_loss=round(float(avg_loss), 4),
             profit_factor=round(profit_factor, 2),

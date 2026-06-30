@@ -127,7 +127,7 @@ class EarningsCalendar:
         self,
         tickers: list[str],
     ) -> dict[str, EarningsInfo]:
-        """Check earnings for multiple tickers.
+        """Check earnings for multiple tickers (parallel).
 
         Args:
             tickers: List of raw tickers.
@@ -135,9 +135,14 @@ class EarningsCalendar:
         Returns:
             Dict mapping ticker -> EarningsInfo.
         """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
         results: dict[str, EarningsInfo] = {}
-        for t in tickers:
-            results[t] = self.get_earnings(t)
+        with ThreadPoolExecutor(max_workers=min(len(tickers), 8)) as pool:
+            futures = {pool.submit(self.get_earnings, t): t for t in tickers}
+            for future in as_completed(futures):
+                t = futures[future]
+                results[t] = future.result()
         return results
 
     def filter_safe(

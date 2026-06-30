@@ -61,8 +61,8 @@ class Condition:
             return False
         op_func = self._OPS.get(self.operator)
         if op_func is None:
-            logger.warning("Unknown operator '%s', skipping condition", self.operator)
-            return True
+            logger.warning("Unknown operator '%s', condition fails", self.operator)
+            return False
         try:
             return op_func(float(val), self.value)
         except (TypeError, ValueError):

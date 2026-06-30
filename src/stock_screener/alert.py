@@ -34,24 +34,10 @@ from .technical_engine import (
 
 logger = logging.getLogger(__name__)
 
-# Default TSE watchlist (Blue chips)
-DEFAULT_TICKERS = [
-    "7203",  # Toyota
-    "6758",  # Sony
-    "9984",  # SoftBank Group
-    "8306",  # Mitsubishi UFJ
-    "6501",  # Hitachi
-    "7267",  # Honda
-    "9434",  # SoftBank Corp
-    "6861",  # Keyence
-    "8411",  # Mizuho
-    "7751",  # Canon
-    "6752",  # Panasonic
-    "7974",  # Nintendo
-    "6178",  # Japan Post
-    "8316",  # Sumitomo Mitsui
-    "9831",  # Yamato Holdings
-]
+# Default watchlist (user's tickers)
+USER_TICKERS = ["6232", "6227", "5801", "7974", "4661", "8001", "9433", "2962", "584A", "6327"]
+AI_TICKERS = ["9984", "5803", "6857", "8035", "5016", "285A", "7735"]
+DEFAULT_TICKERS = USER_TICKERS + AI_TICKERS
 
 
 # ---------------------------------------------------------------------------
@@ -266,27 +252,36 @@ class AlertScanner:
         self.loader = YFinanceDataLoader()
         self.engine = TechnicalEngine()
 
+    def _scan_one(self, ticker: str, start: str, end: str) -> tuple[str, list[Signal]]:
+        """Scan a single ticker (used by parallel scan)."""
+        try:
+            df = self.loader.fetch_ohlcv(ticker, start, end)
+            df = self.engine.enrich(df)
+            signals: list[Signal] = []
+            for strat in self.strategies:
+                signals.extend(strat.generate_signals(df, ticker))
+            return ticker, signals
+        except Exception:
+            logger.exception("Scan failed for %s", ticker)
+            return ticker, []
+
     def scan(self) -> dict[str, list[Signal]]:
-        """Scan all tickers and return signals.
+        """Scan all tickers and return signals (parallel).
 
         Returns:
             Dict mapping ticker -> list of signals.
         """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
         end = datetime.now().strftime("%Y-%m-%d")
         start = (datetime.now() - timedelta(days=self.lookback_days)).strftime("%Y-%m-%d")
         results: dict[str, list[Signal]] = {}
 
-        for ticker in self.tickers:
-            try:
-                df = self.loader.fetch_ohlcv(ticker, start, end)
-                df = self.engine.enrich(df)
-                signals: list[Signal] = []
-                for strat in self.strategies:
-                    signals.extend(strat.generate_signals(df, ticker))
+        with ThreadPoolExecutor(max_workers=min(len(self.tickers), 8)) as pool:
+            futures = {pool.submit(self._scan_one, t, start, end): t for t in self.tickers}
+            for future in as_completed(futures):
+                ticker, signals = future.result()
                 results[ticker] = signals
-            except Exception:
-                logger.exception("Scan failed for %s", ticker)
-                results[ticker] = []
 
         return results
 
@@ -328,7 +323,7 @@ def run_daemon(tickers: list[str], lookback: int = 365) -> None:
 
     scanner = AlertScanner(tickers=tickers, lookback_days=lookback)
 
-    schedule.every().day.at("15:30").do(scanner.scan_and_alert)
+    schedule.every().day.at("15:30", "Asia/Tokyo").do(scanner.scan_and_alert)
     logger.info("Daemon started. Scanning at 15:30 JST daily.")
     logger.info("Watching: %s", ", ".join(tickers))
 

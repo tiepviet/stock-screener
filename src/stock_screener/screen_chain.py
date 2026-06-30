@@ -106,7 +106,7 @@ class ScreenChainer:
             fundamental_conditions = [
                 Condition("roe", ">", 0.08),
                 Condition("pe", "<", 20.0),
-                Condition("pb", "<", 2.0),
+                Condition("pb", "<", 3.0),
                 Condition("eps", ">", 0),
                 Condition("dividend_yield", ">", 0.005),
             ]
@@ -151,10 +151,14 @@ class ScreenChainer:
                 tech_score = self._compute_technical_score(df)
                 fund_score = self._compute_fundamental_score(fund_data)
 
+                raw = {**fund_score, **tech_score}
+                available_weight = sum(self.weights.get(k, 0) for k in raw)
                 composite = sum(
                     self.weights.get(k, 0) * v
-                    for k, v in {**fund_score, **tech_score}.items()
+                    for k, v in raw.items()
                 )
+                if available_weight > 0:
+                    composite /= available_weight
 
                 scored.append(
                     ScoredStock(

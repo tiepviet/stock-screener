@@ -35,12 +35,12 @@ class ConfirmedSignal:
     entry_price: float
     stop_loss: float | None
     daily_signal: Signal
-    weekly_signal: Signal | None
+    weekly_confirmed: bool
     confidence: float  # 0.0 to 1.0
 
     def __str__(self) -> str:
         sl = f" SL={self.stop_loss:.2f}" if self.stop_loss else ""
-        wk = " (weekly confirmed)" if self.weekly_signal else " (daily only)"
+        wk = " (weekly confirmed)" if self.weekly_confirmed else " (daily only)"
         return (
             f"[{self.signal_type.value}] {self.ticker} "
             f"@ {self.entry_price:.2f} ({self.strategy}) "
@@ -129,7 +129,7 @@ class MultiTimeframeConfirmer:
                         entry_price=sig.price,
                         stop_loss=sig.stop_loss,
                         daily_signal=sig,
-                        weekly_signal=sig if weekly_trend_up else None,
+                        weekly_confirmed=weekly_trend_up,
                         confidence=round(confidence, 2),
                     )
                 )

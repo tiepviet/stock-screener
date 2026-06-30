@@ -227,15 +227,21 @@ class PriceTargetEngine:
         swing_lows: list[float] = []
 
         for i in range(n, len(df) - n):
-            # Swing high
+            # Swing high: high == max of full window and strictly higher than neighbors
             window_high = highs[i - n : i + n + 1]
-            if highs[i] == window_high.max() and highs[i] > highs[i - 1]:
-                swing_highs.append(float(highs[i]))
+            if highs[i] == window_high.max():
+                left_max = max(highs[i - n : i])
+                right_max = max(highs[i + 1 : i + n + 1])
+                if highs[i] > left_max and highs[i] > right_max:
+                    swing_highs.append(float(highs[i]))
 
-            # Swing low
+            # Swing low: low == min of full window and strictly lower than neighbors
             window_low = lows[i - n : i + n + 1]
-            if lows[i] == window_low.min() and lows[i] < lows[i - 1]:
-                swing_lows.append(float(lows[i]))
+            if lows[i] == window_low.min():
+                left_min = min(lows[i - n : i])
+                right_min = min(lows[i + 1 : i + n + 1])
+                if lows[i] < left_min and lows[i] < right_min:
+                    swing_lows.append(float(lows[i]))
 
         # Cluster nearby levels (within 2% of each other)
         resistance_levels = self._cluster_levels(swing_highs, threshold_pct=0.02)

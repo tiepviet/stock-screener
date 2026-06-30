@@ -293,6 +293,7 @@ st.title("Tokyo Stock Exchange — Screener & Signal Dashboard")
 # ---------------------------------------------------------------------------
 
 loader = YFinanceDataLoader()
+loader._evict_stale_cache()  # Clean old cache at startup (issue #6)
 engine = TechnicalEngine()
 
 
@@ -324,10 +325,14 @@ _auto_scan_stop = threading.Event()
 _auto_scan_last: str = ""
 _auto_scan_lock = threading.Lock()
 
-DEFAULT_TICKERS_5 = ["7203", "6758", "9984", "8306", "6501"]
-DEFAULT_TICKERS_10 = DEFAULT_TICKERS_5 + ["7267", "9434", "6861", "8411", "7751"]
-DEFAULT_TICKERS_15 = DEFAULT_TICKERS_10 + ["6752", "7974", "6178", "8316", "9831"]
-DEFAULT_ALERT_TICKERS = DEFAULT_TICKERS_10
+USER_TICKERS = ["6232", "6227", "5801", "7974", "4661", "8001", "9433", "2962", "584A", "6327"]
+AI_TICKERS = ["9984", "5803", "6857", "8035", "5016", "285A", "7735"]
+ALL_TICKERS = USER_TICKERS + AI_TICKERS
+
+DEFAULT_TICKERS_5 = USER_TICKERS[:5]
+DEFAULT_TICKERS_10 = USER_TICKERS
+DEFAULT_TICKERS_15 = USER_TICKERS + AI_TICKERS[:5]
+DEFAULT_ALERT_TICKERS = ALL_TICKERS
 
 
 def _auto_scan_worker(
@@ -519,8 +524,7 @@ with tab_chart:
                 st.session_state.loaded_ticker = chart_ticker
                 st.session_state.loaded_interval = chart_interval
                 st.session_state.loaded_lookback = lookback_days
-            else:
-                st.session_state.chart_df = None
+            # else: keep old chart_df, don't clear on fetch error
 
         df = st.session_state.get("chart_df")
         if df is not None and not df.empty:
@@ -713,10 +717,10 @@ with tab_signals:
                 done_count += 1
                 progress.progress(done_count / len(tickers))
 
-        progress.empty()
-
         for err in errors:
             st.warning(f"Failed: {err}")
+
+        progress.empty()
 
         if not all_signals:
             st.info("No signals found in this period.")
@@ -805,12 +809,16 @@ with tab_signals:
                     added = 0
                     for plan in plans:
                         try:
-                            pf.add_position(plan)
+                            pf.add_position(plan, trail_pct=0.05)
+                            pf.recalc_targets(plan.ticker)
                             added += 1
                         except Exception as e:
                             logger.exception("add_position failed for %s", plan.ticker)
                             st.warning(f"{plan.ticker}: {e}")
-                    st.success(f"Added {added}/{len(plans)} positions")
+                    st.success(
+                        f"Added {added}/{len(plans)} positions with 5% trailing stop "
+                        f"& auto TP targets"
+                    )
             else:
                 st.info("No positions within capital limit.")
 
@@ -834,8 +842,12 @@ with tab_signals:
 
             # Strategy breakdown
             st.subheader("By Strategy")
-            strat_cols = st.columns(4)
-            for i, strat_name in enumerate(sorted({s.strategy for s in all_signals})):
+            strat_names = sorted({s.strategy for s in all_signals})
+            n_strat = len(strat_names)
+            strat_cols = st.columns(max(n_strat, 1))
+            for i, strat_name in enumerate(strat_names):
+                if i >= len(strat_cols):
+                    break
                 count = sum(1 for s in all_signals if s.strategy == strat_name)
                 strat_cols[i].metric(strat_name, str(count))
 
@@ -898,7 +910,7 @@ with tab_backtest:
             c6.metric("Winners", str(result.winning_trades),
                       delta=f"{result.win_rate:.0f}%", delta_color="normal")
             c7.metric("Losers", str(result.losing_trades),
-                      delta=f"{result.losing_rate:.0f}%" if hasattr(result, 'losing_rate') else "",
+                      delta=f"{result.losing_rate:.0%}",
                       delta_color="inverse")
             c8.metric("Profit Factor", f"{result.profit_factor:.2f}",
                       delta="profitable" if result.profit_factor >= 1.5 else "marginal",
@@ -960,11 +972,29 @@ with tab_portfolio:
 
     portfolio = PortfolioTracker(total_capital=capital, max_sector_pct=0.30)
 
-    # Refresh prices
-    if st.button("Refresh Prices", key="refresh_prices"):
-        with st.spinner("Updating prices..."):
-            portfolio.update_prices()
-        st.success("Prices updated")
+    col_refresh, col_check, _ = st.columns([1, 1, 4])
+    with col_refresh:
+        if st.button("🔄 Refresh Prices", key="refresh_prices"):
+            with st.spinner("Updating prices..."):
+                portfolio.update_prices()
+            st.success("Prices updated")
+    with col_check:
+        if st.button("🔍 Check All", key="check_all"):
+            with st.spinner("Checking..."):
+                portfolio.update_prices()
+                events = portfolio.full_check()
+            msg = []
+            if events["stop_losses"]:
+                msg.append(f"SL: {', '.join(events['stop_losses'])}")
+            if events["trailing_stops"]:
+                msg.append(f"Trail: {', '.join(events['trailing_stops'])}")
+            if events["take_profits"]:
+                for t, idxs in events["take_profits"].items():
+                    msg.append(f"TP {t}: levels {idxs}")
+            if msg:
+                st.warning(" | ".join(msg))
+            else:
+                st.success("All positions OK — no events")
 
     # Stats
     stats = portfolio.stats()
@@ -999,11 +1029,62 @@ with tab_portfolio:
     # Open positions
     pos_df = portfolio.summary_df()
     if not pos_df.empty:
-        st.subheader("Open Positions")
+        st.subheader("Open Positions — Actions")
+        for ticker, pos in list(portfolio.positions.items()):
+            with st.container(border=True):
+                cols = st.columns([2, 1.5, 1.5, 1.5, 1, 1, 1])
+                cols[0].markdown(f"**{ticker}**")
+                cols[1].metric("P/L", f"¥{pos.unrealized_pnl:+,.0f}", delta=f"{pos.unrealized_pnl_pct:.2%}")
+                cols[2].metric("Peak→Now", f"{pos.pnl_since_peak:.2%}", delta_color="inverse")
+                dd_flag = "⚠️" if pos.pnl_since_peak < -0.05 else "✅"
+                cols[2].markdown(f"<span style='font-size:1.2rem'>{dd_flag}</span>", unsafe_allow_html=True)
+
+                # Trail status
+                if pos.trail_pct > 0:
+                    cols[3].metric(f"Trail {pos.trail_pct:.0%}", f"¥{pos.trailing_stop:,.0f}")
+                else:
+                    trail_pct = cols[3].number_input(
+                        "Trail %", min_value=0.0, max_value=20.0, value=5.0, step=1.0,
+                        key=f"trail_pct_{ticker}", label_visibility="collapsed",
+                    )
+                    if cols[3].button("🔐 Enable Trail", key=f"trail_btn_{ticker}"):
+                        portfolio.enable_trailing(ticker, trail_pct / 100)
+                        st.rerun()
+
+                # TP levels
+                tp_text = " | ".join(
+                    f"¥{tp:,.0f}{' ✅' if pos.tp_hit[i] else ''}"
+                    for i, tp in enumerate(pos.take_profit_levels)
+                ) if pos.take_profit_levels else "—"
+                cols[4].markdown(f"<small>TPs: {tp_text}</small>", unsafe_allow_html=True)
+                if cols[4].button("🔄 Calc TPs", key=f"calc_tp_{ticker}"):
+                    portfolio.recalc_targets(ticker)
+                    st.rerun()
+
+                # Close button
+                if cols[5].button("✕ Close", key=f"close_pos_{ticker}"):
+                    portfolio.close_position(ticker, pos.current_price, "MANUAL")
+                    st.rerun()
+
+                # Stop-loss alert
+                if pos.current_price > 0 and pos.current_price <= pos.stop_loss:
+                    st.error(f"🔴 **STOP LOSS HIT** @ ¥{pos.current_price:,.0f} (SL=¥{pos.stop_loss:,.0f})")
+                if pos.trail_pct > 0 and pos.current_price <= pos.trailing_stop:
+                    st.warning(f"🟡 **TRAILING STOP HIT** @ ¥{pos.current_price:,.0f}")
+                for i, tp in enumerate(pos.take_profit_levels):
+                    if pos.current_price >= tp and not pos.tp_hit[i]:
+                        level = i + 1
+                        gain = (tp - pos.entry_price) / pos.entry_price * 100
+                        st.success(f"🟢 **TP{level} REACHED** ¥{tp:,.0f} (+{gain:.1f}%) — consider partial exit")
+
+        # Summary table
+        st.subheader("Open Positions — Summary")
         st.dataframe(pos_df.style.format({
             "entry_price": "¥{:.2f}",
             "current_price": "¥{:.2f}",
             "stop_loss": "¥{:.2f}",
+            "trailing_stop": "¥{:.2f}",
+            "peak_price": "¥{:.2f}",
             "unrealized_pnl": "¥{:,.0f}",
             "unrealized_pnl_pct": "{:.2%}",
         }), width='stretch')
@@ -1016,7 +1097,6 @@ with tab_portfolio:
         )
     else:
         st.info("No open positions.")
-
 
     # Closed trades
     closed_df = portfolio.closed_trades_df()
@@ -1172,7 +1252,7 @@ with tab_mtf:
                 "Entry": f"¥{c.entry_price:,.0f}",
                 "SL": f"¥{c.stop_loss:,.0f}" if c.stop_loss else "—",
                 "Confidence": f"{c.confidence:.0%}",
-                "Weekly": "✓" if c.weekly_signal else "—",
+                "Weekly": "✓" if c.weekly_confirmed else "—",
             } for c in confirmed]
             st.dataframe(pd.DataFrame(rows), width='stretch')
             st.download_button(
@@ -1455,7 +1535,7 @@ with tab_pt:
                 st.stop()
 
         entry_val = pt_entry if pt_entry > 0 else float(df["Close"].iloc[-1])
-        sl_val = entry_val * 0.93  # 7% hard stop
+        sl_val = entry_val * (1 - hard_stop)  # sidebar hard-stop %
 
         pte = PriceTargetEngine(swing_lookback=20, atr_period=14, atr_mult=1.5)
         targets = pte.compute_all(df, pt_ticker, entry_price=entry_val, stop_loss=sl_val)
@@ -1637,9 +1717,63 @@ For daily automated scan, set up **GitHub Actions**:
                     for s in sigs:
                         st.code(str(s), language=None)
 
+    st.markdown("---")
+    st.subheader("Portfolio Position Monitor")
+
+    st.markdown("""
+    Check open positions for **stop-loss**, **trailing stop**, and **take-profit** events.
+    Useful as a pre-market or post-market health check.
+    """)
+
+    if st.button("🔍 Check Portfolio Positions", key="pf_check_alerts"):
+        pf = PortfolioTracker(total_capital=capital, max_sector_pct=0.30)
+        with st.spinner("Checking portfolio..."):
+            pf.update_prices()
+            events = pf.full_check()
+
+        sl = events["stop_losses"]
+        ts = events["trailing_stops"]
+        tp = events["take_profits"]
+
+        if not sl and not ts and not tp:
+            st.success("All positions OK — no events triggered")
+        else:
+            if sl:
+                for t in sl:
+                    pos = pf.positions.get(t)
+                    p = pos.current_price if pos else 0
+                    st.error(f"🔴 **{t}**: STOP LOSS @ ¥{p:,.0f}")
+            if ts:
+                for t in ts:
+                    pos = pf.positions.get(t)
+                    p = pos.trailing_stop if pos else 0
+                    st.warning(f"🟡 **{t}**: TRAILING STOP @ ¥{p:,.0f}")
+            if tp:
+                for t, levels in tp.items():
+                    pos = pf.positions.get(t)
+                    for idx in levels:
+                        tp_price = pos.take_profit_levels[idx] if pos else 0
+                        gain = (tp_price - pos.entry_price) / pos.entry_price * 100 if pos else 0
+                        st.success(f"🟢 **{t}**: TP{idx+1} HIT ¥{tp_price:,.0f} (+{gain:.1f}%)")
+
+        # Send alerts via Telegram/Slack
+        lines = []
+        if sl:
+            lines.append(f"🔴 STOP LOSS: {', '.join(sl)}")
+        if ts:
+            lines.append(f"🟡 TRAILING STOP: {', '.join(ts)}")
+        if tp:
+            for t, idxs in tp.items():
+                lines.append(f"🟢 {t} TP hit: levels {idxs}")
+        if lines:
+            msg = "\n".join(lines)
+            TelegramSender().send(f"<b>Portfolio Alert</b>\n{msg}")
+            SlackSender().send(f"*Portfolio Alert*\n{msg}")
+            st.toast("Alerts sent to Telegram/Slack!")
+
 
 # ============================
-# TAB 9: Guide
+# TAB 12: Guide
 # ============================
 
 with tab_guide:
