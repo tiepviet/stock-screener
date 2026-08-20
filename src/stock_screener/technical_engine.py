@@ -226,6 +226,11 @@ class VolumeBreakoutStrategy(BaseStrategy):
 
         for i in range(self.lookback, len(df)):
             row = df.iloc[i]
+            # NaN close/volume (suspended day) must not produce a NaN-priced
+            # "breakout" — `NaN <= x` is False, so the guards below are
+            # REQUIRED (a plain comparison would pass them through).
+            if pd.isna(closes.iloc[i]) or pd.isna(volumes.iloc[i]):
+                continue
             # 1. Price breakout: close > highest high of prior N bars
             prev_high = highs.iloc[i - self.lookback : i].max()
             if closes.iloc[i] <= prev_high:
@@ -416,9 +421,10 @@ class TrendBreakdownSellStrategy(BaseStrategy):
             # 2. Below confirm MA
             if curr_close >= confirm:
                 continue
-            # 3. Volume surge
+            # 3. Volume surge (NaN volume must not count as a surge — the
+            # comparison below would silently pass a suspended day through)
             vol_sma = row[vol_sma_col]
-            if pd.isna(vol_sma) or vol_sma == 0:
+            if pd.isna(vol_sma) or vol_sma == 0 or pd.isna(row["Volume"]):
                 continue
             if row["Volume"] < self.volume_mult * vol_sma:
                 continue
@@ -492,6 +498,10 @@ class OverboughtReversalSellStrategy(BaseStrategy):
             trend = row[trend_col]
 
             if pd.isna(prev_rsi) or pd.isna(curr_rsi) or pd.isna(trend):
+                continue
+            # NaN close would pass every comparison below (NaN >= x is False)
+            # and emit a NaN-priced sell signal.
+            if pd.isna(prev_close) or pd.isna(curr_close):
                 continue
 
             # 1. Was overbought, now dropping

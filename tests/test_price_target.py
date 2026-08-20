@@ -187,6 +187,12 @@ class TestPriceTargetEngine:
         # Should cluster into ~2 groups
         assert len(clustered) <= 4
 
+    def test_cluster_levels_zero_base_no_crash(self) -> None:
+        """B8: a 0-valued level must not cause ZeroDivisionError."""
+        clustered = PriceTargetEngine._cluster_levels([0.0, 0.001, 5.0, 5.2])
+        assert len(clustered) >= 1
+        assert clustered[0] == 0.0  # round(0.0005, 2)
+
     def test_support_resistance(self) -> None:
         engine = PriceTargetEngine(swing_lookback=10)
         df = _make_ohlcv(100)

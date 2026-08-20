@@ -32,9 +32,11 @@ def test_condition_missing_metric_fails_strict() -> None:
     assert not c.evaluate({})
 
 
-def test_condition_unknown_operator_skips() -> None:
+def test_condition_unknown_operator_fails_closed() -> None:
+    """Unknown operators fail closed — a broken condition must not pass stocks."""
     c = Condition("roe", "??", 0.10)
-    assert c.evaluate({"roe": 0.05})
+    assert not c.evaluate({"roe": 0.05})
+    assert not c.evaluate({"roe": 0.50})
 
 
 def test_condition_handles_none_value() -> None:

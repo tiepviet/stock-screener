@@ -33,7 +33,7 @@ from src.stock_screener.alert import AlertScanner, SlackSender, TelegramSender
 from src.stock_screener.backtest import Backtester
 
 # Local modules
-from src.stock_screener.data_loader import YFinanceDataLoader
+from src.stock_screener.data_loader import YFinanceDataLoader, jst_now
 from src.stock_screener.earnings_calendar import EarningsCalendar
 from src.stock_screener.fundamental_screener import Condition, FundamentalScreener
 from src.stock_screener.multi_timeframe import MultiTimeframeConfirmer
@@ -49,6 +49,7 @@ from src.stock_screener.technical_engine import (
     TrendBreakdownSellStrategy,
     VolumeBreakoutStrategy,
 )
+from src.stock_screener.watchlist import AI_TICKERS, DEFAULT_TICKERS, USER_TICKERS
 
 logging.basicConfig(
     level=logging.INFO,
@@ -110,12 +111,21 @@ if st.session_state.auth_user is None:
     if _token and _token not in (None, "", "null"):
         payload = jwt_auth.verify_token(_token)
         if payload is not None:
-            # Cross-check user still exists in DB
+            # Cross-check user still exists in DB and token version matches
+            # (revoked by logout or password change).
             rec = auth.get_by_username(payload.get("username", ""))
-            if rec is not None and str(rec.id) == str(payload.get("sub")):
+            try:
+                version_ok = (
+                    rec is not None
+                    and str(rec.id) == str(payload.get("sub"))
+                    and int(payload.get("tv", -1)) == auth.get_token_version(rec.id)
+                )
+            except KeyError:
+                version_ok = False  # user deleted mid-check — treat as stale
+            if version_ok:
                 st.session_state.auth_user = rec
             else:
-                # User deleted or username changed — purge stale token
+                # User deleted, token revoked, or version bumped — purge stale token
                 streamlit_js_eval(
                     js_expressions="localStorage.removeItem('tse_jwt')",
                     key="_jwt_clear_stale",
@@ -130,13 +140,27 @@ if st.session_state.auth_user is None:
 
 def _issue_token_and_login(rec: auth.UserRecord) -> None:
     """Store JWT in localStorage and mark session as authenticated."""
-    token = jwt_auth.create_token(rec.id, rec.username)
+    token = jwt_auth.create_token(
+        rec.id, rec.username, token_version=auth.get_token_version(rec.id)
+    )
     safe_token = json.dumps(token)
     streamlit_js_eval(
         js_expressions=f"localStorage.setItem('tse_jwt', {safe_token})",
         key="_jwt_issue",
     )
     st.session_state.auth_user = rec
+
+
+def _client_ip() -> str:
+    """Best-effort client IP from request headers (None if unavailable)."""
+    try:
+        return (
+            st.context.headers.get("X-Forwarded-For", "unknown")
+            .split(",")[0]
+            .strip()
+        )
+    except Exception:
+        return "unknown"
 
 
 def _render_auth_page() -> None:
@@ -249,8 +273,14 @@ def _render_auth_page() -> None:
                     if is_vn else "Enter both username and password."
                 )
             else:
-                rec = auth.verify_user(u, p)
-                if rec is None:
+                rec, login_err = auth.attempt_login(u, p, _client_ip())
+                if login_err == "locked":
+                    st.error(
+                        "Quá nhiều lần đăng nhập thất bại. Thử lại sau 15 phút."
+                        if is_vn else
+                        "Too many failed attempts. Try again in 15 minutes."
+                    )
+                elif rec is None:
                     st.error(
                         "Tên đăng nhập hoặc mật khẩu không chính xác."
                         if is_vn else "Invalid username or password."
@@ -278,15 +308,28 @@ USER_ID = USER.id
 with st.sidebar:
     st.caption(f"👤 **{USER.username}**")
     if st.button("Sign out", key="signout", width='stretch'):
-        # Clear token from localStorage + session
+        # Revoke all outstanding tokens, then clear this client's copy
+        try:
+            auth.increment_token_version(USER_ID)
+        except KeyError:
+            pass  # user deleted — nothing to revoke
         streamlit_js_eval(
             js_expressions="localStorage.removeItem('tse_jwt')",
             key="_jwt_clear_signout",
         )
         st.session_state.auth_user = None
+        # Wipe every per-user value (sidebar settings, target rows, cached
+        # scans) so the next login on this browser session starts clean —
+        # otherwise user B inherits user A's data and later writes clobber
+        # B's own persisted settings. Streamlit internals start with "$".
+        for k in [k for k in st.session_state if not k.startswith("$") and k != "auth_user"]:
+            del st.session_state[k]
         st.rerun()
 
 st.title("Tokyo Stock Exchange — Screener & Signal Dashboard")
+
+# Module-scope language flag for all tabs (login page has its own local copy).
+is_vn = st.session_state.get("sb_lang", "EN") == "VN"
 
 # ---------------------------------------------------------------------------
 # Shared state
@@ -325,9 +368,7 @@ _auto_scan_stop = threading.Event()
 _auto_scan_last: str = ""
 _auto_scan_lock = threading.Lock()
 
-USER_TICKERS = ["6232", "6227", "5801", "7974", "4661", "8001", "9433", "2962", "584A", "6327"]
-AI_TICKERS = ["9984", "5803", "6857", "8035", "5016", "285A", "7735"]
-ALL_TICKERS = USER_TICKERS + AI_TICKERS
+ALL_TICKERS = DEFAULT_TICKERS
 
 DEFAULT_TICKERS_5 = USER_TICKERS[:5]
 DEFAULT_TICKERS_10 = USER_TICKERS
@@ -503,7 +544,11 @@ with tab_chart:
         show_sma = st.checkbox("Show SMA", value=True)
         sma_period = st.selectbox("SMA Period", [20, 50, 200], index=0)
         show_vol = st.checkbox("Show Volume", value=True)
-        user_store.set_setting(USER_ID, "chart_ticker", st.session_state.chart_ticker)
+        # Persist only on change — writing on every rerun hits SQLite per
+        # interaction even when the ticker never moved.
+        if st.session_state.get("_chart_ticker_persisted") != st.session_state.chart_ticker:
+            user_store.set_setting(USER_ID, "chart_ticker", st.session_state.chart_ticker)
+            st.session_state._chart_ticker_persisted = st.session_state.chart_ticker
 
     with col1:
         # Determine if we should load the chart
@@ -515,8 +560,8 @@ with tab_chart:
             should_load = True
 
         if should_load:
-            end = datetime.now().strftime("%Y-%m-%d")
-            start = (datetime.now() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+            end = jst_now().strftime("%Y-%m-%d")
+            start = (jst_now() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
             df = safe_fetch_ohlcv(chart_ticker, start, end, chart_interval)
             if df is not None:
                 df = engine.enrich(df)
@@ -618,8 +663,24 @@ with tab_screen:
         height=200,
     )
 
+    wl_filter = st.checkbox(
+        "Only watchlist" if not is_vn else "Chỉ xem watchlist",
+        value=False,
+        key="screen_wl_only",
+        help=None,
+    )
+
     if st.button("Run Screener", key="run_screen"):
         tickers = [t.strip() for t in tickers_input.strip().splitlines() if t.strip()]
+        if wl_filter:
+            wl = user_store.get_watchlist(USER_ID)
+            if wl:
+                tickers = [t for t in tickers if t in wl]
+            else:
+                st.info(
+                    "Watchlist trống — đang chạy trên toàn bộ danh sách."
+                    if is_vn else "Watchlist empty — screening all tickers."
+                )
         conditions = [
             Condition("roe", ">", min_roe),
             Condition("pe", "<", max_pe),
@@ -647,6 +708,30 @@ with tab_screen:
                 }),
                 width='stretch',
             )
+            if st.button(
+                "➕ Thêm tất cả vào watchlist" if is_vn else "➕ Add all to watchlist",
+                key="wl_add_results",
+            ):
+                passed = results["ticker"].tolist()
+                for t in passed:
+                    user_store.add_to_watchlist(USER_ID, t)
+                st.success(
+                    f"Đã thêm {len(passed)} mã vào watchlist."
+                    if is_vn else f"Added {len(passed)} tickers to watchlist."
+                )
+                st.rerun()
+
+    with st.expander("📋 Watchlist" if not is_vn else "📋 Watchlist của bạn"):
+        wl = user_store.get_watchlist(USER_ID)
+        if not wl:
+            st.caption("Empty — add tickers from screen results." if not is_vn else "Trống — thêm từ kết quả screen.")
+        else:
+            cols = st.columns(6)
+            for i, t in enumerate(wl):
+                with cols[i % 6]:
+                    if st.button(f"✕ {t}", key=f"wl_rm_{t}"):
+                        user_store.remove_from_watchlist(USER_ID, t)
+                        st.rerun()
 
 
 # ============================
@@ -676,8 +761,8 @@ with tab_signals:
             st.warning("No tickers to scan")
             st.stop()
 
-        end = datetime.now().strftime("%Y-%m-%d")
-        start = (datetime.now() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+        end = jst_now().strftime("%Y-%m-%d")
+        start = (jst_now() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
 
         vb_strategy = VolumeBreakoutStrategy(
             lookback=vb_lookback, volume_mult=vb_vol_mult
@@ -746,6 +831,7 @@ with tab_signals:
                 st.subheader("Take-Profit Targets")
                 pte = PriceTargetEngine(swing_lookback=20, atr_period=14, atr_mult=1.5)
                 tp_rows = []
+                tp_errors = 0
                 for sig in buy_signals[:10]:  # Limit to 10 for performance
                     try:
                         sig_df_raw = loader.fetch_ohlcv(sig.ticker, start, end)
@@ -765,7 +851,9 @@ with tab_signals:
                             "R:R": f"{rr_ratio:.2f}" if rr_ratio > 0 else "—",
                         })
                     except Exception:
-                        pass
+                        tp_errors += 1
+                if tp_errors:
+                    st.caption(f"{tp_errors} ticker(s) skipped — TP data unavailable.")
                 if tp_rows:
                     st.dataframe(pd.DataFrame(tp_rows), width='stretch', hide_index=True)
 
@@ -869,11 +957,12 @@ with tab_backtest:
         bt_lookback = st.slider("Lookback (days)", 180, 1095, 730, 30, key="bt_look")
         bt_risk = st.slider("Risk/Trade (%)", 0.5, 5.0, 1.0, 0.1, key="bt_risk") / 100
         bt_max_hold = st.slider("Max Hold (days)", 10, 120, 60, 5, key="bt_hold")
-        bt_commission = st.number_input("Commission (%)", value=0.0, step=0.05, key="bt_comm") / 100
+        bt_commission = st.number_input("Commission (%)", value=0.1, step=0.05, key="bt_comm") / 100
+        bt_slippage = st.number_input("Slippage (%)", value=0.1, step=0.05, key="bt_slip") / 100
 
     if st.button("Run Backtest", key="run_bt"):
-        end = datetime.now().strftime("%Y-%m-%d")
-        start = (datetime.now() - timedelta(days=bt_lookback)).strftime("%Y-%m-%d")
+        end = jst_now().strftime("%Y-%m-%d")
+        start = (jst_now() - timedelta(days=bt_lookback)).strftime("%Y-%m-%d")
         try:
             df = loader.fetch_ohlcv(bt_ticker, start, end)
 
@@ -889,6 +978,7 @@ with tab_backtest:
                 max_holding_days=bt_max_hold,
                 take_profit_pct=bt_take_profit,
                 commission_pct=bt_commission,
+                slippage_pct=bt_slippage,
             )
             result = bt.run_multi(df, strategy, bt_ticker)
 
@@ -1061,10 +1151,15 @@ with tab_portfolio:
                     portfolio.recalc_targets(ticker)
                     st.rerun()
 
-                # Close button
+                # Close button — a never-refreshed position has current_price
+                # 0.0, and close_position raises on non-positive prices; don't
+                # let one stale position red-screen the whole tab.
                 if cols[5].button("✕ Close", key=f"close_pos_{ticker}"):
-                    portfolio.close_position(ticker, pos.current_price, "MANUAL")
-                    st.rerun()
+                    if pos.current_price <= 0:
+                        st.warning(f"{ticker}: no current price yet — refresh prices first.")
+                    else:
+                        portfolio.close_position(ticker, pos.current_price, "MANUAL")
+                        st.rerun()
 
                 # Stop-loss alert
                 if pos.current_price > 0 and pos.current_price <= pos.stop_loss:
@@ -1129,6 +1224,11 @@ with tab_earnings:
 
     if st.button("Check Earnings", key="check_earn"):
         tickers = [t.strip() for t in earn_tickers.strip().splitlines() if t.strip()]
+        if not tickers:
+            st.warning(
+                "Nhập ít nhất 1 mã để kiểm tra." if is_vn else "Enter at least one ticker to check."
+            )
+            st.stop()
         cal = EarningsCalendar(loader=loader, warning_days=warn_days)
 
         with st.spinner("Checking earnings dates..."):
@@ -1180,21 +1280,37 @@ Pipeline: **Fundamental** (ROE, P/E, P/B, EPS) → **Technical** (SMA200 uptrend
     with col_c1:
         chain_top_n = st.slider("Top N Results", 5, 30, 10, key="chain_top")
         chain_roe = st.number_input("Min ROE (%)", value=8.0, step=1.0, key="chain_roe") / 100
+        chain_pb = st.number_input("Max P/B", value=3.0, step=0.5, key="chain_pb")
     with col_c2:
         chain_pe = st.number_input("Max P/E", value=20.0, step=1.0, key="chain_pe")
+        chain_min_div = st.number_input("Min Dividend (%)", value=0.5, step=0.1, key="chain_div") / 100
         chain_lookback = st.slider("Technical Lookback", 180, 730, 365, 30, key="chain_lb")
+
+    st.markdown("**Scoring weights** (auto-normalized)")
+    cw = st.columns(6)
+    weights_raw = {}
+    for i, (factor, label) in enumerate(
+        [("roe", "ROE"), ("pe", "P/E"), ("trend", "Trend"),
+         ("volume", "Volume"), ("rsi", "RSI"), ("dividend", "Div")]
+    ):
+        with cw[i]:
+            weights_raw[factor] = st.slider(label, 0, 50, 10, key=f"chain_w_{factor}") / 100
+    total_w = sum(weights_raw.values()) or 1.0
+    weights = {k: v / total_w for k, v in weights_raw.items()}
+    if total_w == 0 or all(v == 0 for v in weights_raw.values()):
+        st.warning("All weights are 0 — every stock would score 0 and ranking is meaningless. Raise at least one factor.")
 
     if st.button("Run Smart Screen", key="run_chain"):
         tickers = [t.strip() for t in chain_tickers.strip().splitlines() if t.strip()]
         conditions = [
             Condition("roe", ">", chain_roe),
             Condition("pe", "<", chain_pe),
-            Condition("pb", "<", 3.0),
+            Condition("pb", "<", chain_pb),
             Condition("eps", ">", 0),
-            Condition("dividend_yield", ">", 0.005),
+            Condition("dividend_yield", ">", chain_min_div),
         ]
 
-        chainer = ScreenChainer(loader=loader)
+        chainer = ScreenChainer(loader=loader, weights=weights)
         with st.spinner("Running multi-pass screen..."):
             results = chainer.run(
                 tickers,
@@ -1378,7 +1494,13 @@ with tab_target:
         })
 
     if remove_idx is not None:
-        st.session_state.target_rows.pop(remove_idx)
+        # Rebuild from CURRENT widget values (keeps edits on surviving rows),
+        # then drop every index-keyed widget key so rows re-map to their own
+        # data — otherwise rows below the deleted one inherit its stale state.
+        rows_after.pop(remove_idx)
+        st.session_state.target_rows = rows_after
+        for k in [k for k in st.session_state if k.startswith("tt_")]:
+            del st.session_state[k]
         st.rerun()
 
     st.session_state.target_rows = rows_after
@@ -1391,6 +1513,8 @@ with tab_target:
         st.rerun()
     if btn_b.button("🗑 Xóa tất cả" if is_vn else "🗑 Clear All", key="tt_clear"):
         st.session_state.target_rows = []
+        for k in [k for k in st.session_state if k.startswith("tt_")]:
+            del st.session_state[k]
         st.rerun()
 
     valid_rows: list[TargetRow] = []
@@ -1488,8 +1612,12 @@ with tab_target:
                 key="dl_targets",
             )
 
-    # Persist rows to SQLite on every render
-    user_store.save_target_rows(USER_ID, st.session_state.target_rows)
+    # Persist rows to SQLite only when they actually changed — the previous
+    # version did a DELETE+INSERT on every rerun (every slider tick, every
+    # tab switch), hammering the DB with no-op writes.
+    if st.session_state.get("_tt_persisted") != st.session_state.target_rows:
+        user_store.save_target_rows(USER_ID, st.session_state.target_rows)
+        st.session_state._tt_persisted = list(st.session_state.target_rows)
 
 
 # ============================
@@ -1525,8 +1653,8 @@ with tab_pt:
             st.stop()
 
         with st.spinner(f"Fetching {pt_ticker}..."):
-            end = datetime.now().strftime("%Y-%m-%d")
-            start = (datetime.now() - timedelta(days=pt_lookback)).strftime("%Y-%m-%d")
+            end = jst_now().strftime("%Y-%m-%d")
+            start = (jst_now() - timedelta(days=pt_lookback)).strftime("%Y-%m-%d")
             try:
                 df = loader.fetch_ohlcv(pt_ticker, start, end)
                 df = engine.enrich(df)
@@ -1686,6 +1814,13 @@ For daily automated scan, set up **GitHub Actions**:
 
     if st.button("Scan & Send Alerts", key="run_alerts"):
         tickers = [t.strip() for t in alert_tickers.strip().splitlines() if t.strip()]
+        if not tickers:
+            # AlertScanner silently falls back to ALL default tickers on an
+            # empty list — never send a surprise broadcast.
+            st.warning(
+                "Nhập ít nhất 1 mã để scan." if is_vn else "Enter at least one ticker to scan."
+            )
+            st.stop()
 
         scanner = AlertScanner(
             tickers=tickers,
@@ -1706,7 +1841,10 @@ For daily automated scan, set up **GitHub Actions**:
                     st.code(str(s), language=None)
 
         st.session_state.last_scan_results = results
-        st.toast("Alerts sent!")
+        if tg_ok or sl_ok:
+            st.toast("Alerts sent!")
+        else:
+            st.toast("Signals scanned — no alert channels configured (set Telegram/Slack).")
 
     # Show cached last scan if available
     if "last_scan_results" in st.session_state:
@@ -1767,9 +1905,12 @@ For daily automated scan, set up **GitHub Actions**:
                 lines.append(f"🟢 {t} TP hit: levels {idxs}")
         if lines:
             msg = "\n".join(lines)
-            TelegramSender().send(f"<b>Portfolio Alert</b>\n{msg}")
-            SlackSender().send(f"*Portfolio Alert*\n{msg}")
-            st.toast("Alerts sent to Telegram/Slack!")
+            tg_ok = TelegramSender().send(f"<b>Portfolio Alert</b>\n{msg}")
+            sl_ok = SlackSender().send(f"*Portfolio Alert*\n{msg}")
+            if tg_ok or sl_ok:
+                st.toast("Alerts sent to Telegram/Slack!")
+            else:
+                st.warning("Events found, but no alert channel delivered the message (check env config).")
 
 
 # ============================
@@ -1827,7 +1968,7 @@ RS = Avg Gain(N) / Avg Loss(N)
 RSI = 100 - (100 / (1 + RS))
 ```
 
-N通常 = 14 phiên.
+N thường = 14 phiên.
 
 **Cách đọc:**
 | Giá trị | Ý nghĩa |
@@ -1860,7 +2001,7 @@ True Range = max(
 ATR = SMA(True Range, N)
 ```
 
-N通常 = 14 phiên.
+N thường = 14 phiên.
 
 **Cách đọc:**
 | Giá trị ATR | Ý nghĩa |
@@ -1872,7 +2013,7 @@ N通常 = 14 phiên.
 
 **Ứng dụng trong hệ thống:**
 - **Stop-loss ATR-based**: `SL = Entry - 2 × ATR` — cắt lỗ dựa trên biến động thực tế.
-- **Position sizing**: ATR越大 → risk per share越大 → số lượng cổ phiếu giảm → bảo vệ vốn.
+- **Position sizing**: ATR càng lớn → rủi ro mỗi cổ phiếu càng cao → số lượng cổ phiếu giảm → bảo vệ vốn.
 
 **Lưu ý:** ATR không cho biết hướng đi của giá, chỉ đo biên độ.
             """)

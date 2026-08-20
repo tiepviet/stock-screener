@@ -14,7 +14,7 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 
-from .technical_engine import BaseStrategy, Signal
+from .technical_engine import BaseStrategy, Signal, SignalType
 
 logger = logging.getLogger(__name__)
 
@@ -108,9 +108,11 @@ class Backtester:
     """Run a strategy over historical data and simulate trades.
 
     Default rules:
-      - Enter on BUY signal at next-bar open.
-      - Exit on stop-loss hit or end of data.
+      - Enter on BUY signal at next-bar open, adjusted for slippage.
+      - Exit on stop-loss hit or end of data, adjusted for slippage.
       - 1 position at a time per ticker.
+      - Every fill pays commission (default 0.1%) plus slippage (default 0.1%),
+        so results are realistic, not optimistic.
     """
 
     def __init__(
@@ -120,7 +122,8 @@ class Backtester:
         hard_stop_pct: float = 0.07,
         max_holding_days: int = 60,
         take_profit_pct: float = 0.0,
-        commission_pct: float = 0.0,
+        commission_pct: float = 0.001,
+        slippage_pct: float = 0.001,
     ) -> None:
         """Initialize backtester.
 
@@ -130,18 +133,31 @@ class Backtester:
             hard_stop_pct: Maximum loss before forced exit.
             max_holding_days: Max days to hold before forced exit (0 = no limit).
             take_profit_pct: Take-profit threshold from entry (0 = disabled).
-            commission_pct: Commission per trade as fraction of position value (0 = none).
+            commission_pct: Commission per trade as fraction of position value.
+            slippage_pct: Slippage per fill as fraction of price. Buys fill
+                worse (entry * (1 + s)), sells fill worse (price * (1 - s)).
         """
         if take_profit_pct < 0:
             raise ValueError("take_profit_pct must be >= 0")
         if not 0 <= commission_pct < 1:
             raise ValueError("commission_pct must be in [0, 1)")
+        if not 0 <= slippage_pct < 1:
+            raise ValueError("slippage_pct must be in [0, 1)")
+        if initial_capital <= 0:
+            raise ValueError("initial_capital must be > 0")
+        if not 0 < risk_per_trade <= 1:
+            raise ValueError("risk_per_trade must be in (0, 1]")
+        if not 0 <= hard_stop_pct < 1:
+            raise ValueError("hard_stop_pct must be in [0, 1)")
+        if max_holding_days < 0:
+            raise ValueError("max_holding_days must be >= 0")
         self.initial_capital = initial_capital
         self.risk_per_trade = risk_per_trade
         self.hard_stop_pct = hard_stop_pct
         self.max_holding_days = max_holding_days
         self.take_profit_pct = take_profit_pct
         self.commission_pct = commission_pct
+        self.slippage_pct = slippage_pct
 
     def run(
         self,
@@ -166,11 +182,20 @@ class Backtester:
         open_trade: Trade | None = None
         equity = [capital]
 
-        # Build signal lookup: date -> list[Signal] (multiple strategies per bar)
+        # Build signal lookup: date -> list[BUY Signal] (multiple strategies per bar)
         signal_map: dict[datetime, list[Signal]] = {}
         for sig in signals:
+            if sig.signal_type != SignalType.BUY:
+                continue
             d = sig.date if isinstance(sig.date, datetime) else pd.Timestamp(sig.date).to_pydatetime()
             signal_map.setdefault(d, []).append(sig)
+
+        prev_date: datetime | None = None
+
+        # Bar-frequency detection: weekly bars must convert max_holding_days to
+        # bar count — calendar-day math would force-exit ~5x too early.
+        bar_gap = df.index[1] - df.index[0] if len(df) >= 2 else pd.Timedelta(days=1)
+        weekly_bars = bar_gap >= pd.Timedelta(days=4)
 
         for i in range(len(df)):
             row = df.iloc[i]
@@ -181,65 +206,83 @@ class Backtester:
             # --- Check open position ---
             if open_trade is not None:
                 days_held = (current_date - open_trade.entry_date).days
+                if weekly_bars:
+                    days_held //= 7
                 take_profit_price = (
                     open_trade.entry_price * (1 + self.take_profit_pct)
                     if self.take_profit_pct > 0
                     else float("inf")
                 )
+                bar_open = float(row["Open"])
 
-                # Take-profit (intra-bar: if high >= TP)
-                if row["High"] >= take_profit_price:
-                    open_trade.close(current_date, take_profit_price, "TAKE_PROFIT")
-                    open_trade.pnl -= self.commission_pct * open_trade.entry_price * open_trade.shares
+                # Stop-loss first (worst case): gap-down below SL exits at open
+                if row["Low"] <= open_trade.stop_loss:
+                    exit_price = min(bar_open, open_trade.stop_loss) * (1 - self.slippage_pct)
+                    open_trade.close(current_date, exit_price, "STOP_LOSS")
+                    self._charge_commission(open_trade, self.commission_pct)
                     capital += (open_trade.entry_price * open_trade.shares) + open_trade.pnl
                     trades.append(open_trade)
                     open_trade = None
 
-                # Stop-loss check (intra-bar: if low <= SL)
-                elif row["Low"] <= open_trade.stop_loss:
-                    open_trade.close(current_date, open_trade.stop_loss, "STOP_LOSS")
-                    open_trade.pnl -= self.commission_pct * open_trade.entry_price * open_trade.shares
+                # Take-profit (intra-bar: if high >= TP); gap-up above TP exits at open
+                elif row["High"] >= take_profit_price:
+                    exit_price = max(bar_open, take_profit_price) * (1 - self.slippage_pct)
+                    open_trade.close(current_date, exit_price, "TAKE_PROFIT")
+                    self._charge_commission(open_trade, self.commission_pct)
                     capital += (open_trade.entry_price * open_trade.shares) + open_trade.pnl
                     trades.append(open_trade)
                     open_trade = None
 
                 # Max holding period
                 elif self.max_holding_days > 0 and days_held >= self.max_holding_days:
-                    open_trade.close(current_date, float(row["Close"]), "MAX_HOLD")
-                    open_trade.pnl -= self.commission_pct * open_trade.entry_price * open_trade.shares
+                    open_trade.close(current_date, float(row["Close"]) * (1 - self.slippage_pct), "MAX_HOLD")
+                    self._charge_commission(open_trade, self.commission_pct)
                     capital += (open_trade.entry_price * open_trade.shares) + open_trade.pnl
                     trades.append(open_trade)
                     open_trade = None
 
-            # --- Check for new entry ---
-            if open_trade is None and current_date in signal_map:
-                sig = signal_map[current_date][0]
-                entry_price = float(row["Open"])  # enter at next-bar open
-                hard_stop = entry_price * (1 - self.hard_stop_pct)
-                strategy_stop = sig.stop_loss if sig.stop_loss else hard_stop
-                stop_loss = max(strategy_stop, hard_stop)
+            # --- Check for new entry (signal fired on the PREVIOUS bar, so the
+            #     entry fills at THIS bar's open — no look-ahead bias) ---
+            if open_trade is None and prev_date is not None and prev_date in signal_map:
+                if pd.isna(row["Open"]):
+                    logger.warning(
+                        "%s: NaN open on %s — skipping entry.", ticker, current_date,
+                    )
+                else:
+                    sig = signal_map[prev_date][0]
+                    entry_price = float(row["Open"]) * (1 + self.slippage_pct)
+                    hard_stop = entry_price * (1 - self.hard_stop_pct)
+                    strategy_stop = sig.stop_loss if sig.stop_loss else hard_stop
+                    stop_loss = max(strategy_stop, hard_stop)
 
-                risk_amount = capital * self.risk_per_trade
-                risk_per_share = entry_price - stop_loss
-                if risk_per_share <= 0:
-                    equity.append(capital)
-                    continue
+                    risk_amount = capital * self.risk_per_trade
+                    risk_per_share = entry_price - stop_loss
+                    if risk_per_share <= 0:
+                        logger.warning(
+                            "%s: risk_per_share <= 0 (entry=%.2f, sl=%.2f). Skipping entry.",
+                            ticker, entry_price, stop_loss,
+                        )
+                    elif capital < entry_price:
+                        logger.warning(
+                            "%s: capital (%.0f) below one-share cost (%.2f). Skipping entry.",
+                            ticker, capital, entry_price,
+                        )
+                    else:
+                        shares = max(1, int(risk_amount / risk_per_share))
+                        cost = shares * entry_price
+                        if cost > capital:
+                            shares = max(1, int(capital / entry_price))
+                            cost = shares * entry_price
 
-                shares = max(1, int(risk_amount / risk_per_share))
-                cost = shares * entry_price
-                if cost > capital:
-                    shares = max(1, int(capital / entry_price))
-                    cost = shares * entry_price
-
-                capital -= cost
-                open_trade = Trade(
-                    ticker=ticker,
-                    strategy=strategy_name,
-                    entry_date=current_date,
-                    entry_price=entry_price,
-                    shares=shares,
-                    stop_loss=round(stop_loss, 2),
-                )
+                        capital -= cost
+                        open_trade = Trade(
+                            ticker=ticker,
+                            strategy=strategy_name,
+                            entry_date=current_date,
+                            entry_price=entry_price,
+                            shares=shares,
+                            stop_loss=round(stop_loss, 2),
+                        )
 
             # Track equity
             if open_trade is not None:
@@ -252,15 +295,23 @@ class Backtester:
             else:
                 equity.append(capital)
 
+            prev_date = current_date
+
         # Close any remaining open position at last bar
         if open_trade is not None:
             last_date = df.index[-1]
             if isinstance(last_date, pd.Timestamp):
                 last_date = last_date.to_pydatetime()
-            open_trade.close(last_date, float(df["Close"].iloc[-1]), "END_OF_DATA")
-            open_trade.pnl -= self.commission_pct * open_trade.entry_price * open_trade.shares
+            # Last bar may hold a NaN close (suspended final day) — use the
+            # most recent valid close instead of poisoning P/L with NaN.
+            valid = df["Close"].dropna()
+            last_close = float(valid.iloc[-1]) if len(valid) else float(open_trade.entry_price)
+            open_trade.close(last_date, last_close * (1 - self.slippage_pct), "END_OF_DATA")
+            self._charge_commission(open_trade, self.commission_pct)
             capital += (open_trade.entry_price * open_trade.shares) + open_trade.pnl
             trades.append(open_trade)
+            # Last equity point tracked raw close; align it with realized capital
+            equity[-1] = capital
 
         # --- Compute metrics ---
         equity_series = pd.Series(equity)
@@ -272,6 +323,15 @@ class Backtester:
             start_date=str(df.index[0].date()),
             end_date=str(df.index[-1].date()),
         )
+
+    @staticmethod
+    def _charge_commission(trade: Trade, commission_pct: float) -> None:
+        """Deduct commission from a closed trade and fold it into pnl_pct so
+        avg_win/avg_loss reflect true net performance (pnl_pct was computed
+        commission-free inside Trade.close)."""
+        trade.pnl -= commission_pct * trade.entry_price * trade.shares
+        cost = trade.entry_price * trade.shares
+        trade.pnl_pct = trade.pnl / cost if cost > 0 else 0.0
 
     def _compute_metrics(
         self,
@@ -294,7 +354,7 @@ class Backtester:
 
         gross_profit = sum(t.pnl for t in winners)
         gross_loss = abs(sum(t.pnl for t in losers))
-        profit_factor = gross_profit / gross_loss if gross_loss > 0 else float("inf")
+        profit_factor = 0.0 if total == 0 else (gross_profit / gross_loss if gross_loss > 0 else float("inf"))
 
         # Sharpe ratio (annualized, assuming daily returns)
         returns = equity_curve.pct_change().dropna()

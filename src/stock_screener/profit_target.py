@@ -8,6 +8,7 @@ total target value, weighted target %, total expected profit).
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
 
@@ -28,6 +29,8 @@ class TargetRow:
     shares: int = 0
 
     def __post_init__(self) -> None:
+        if math.isnan(self.entry_price):
+            raise ValueError("entry_price must be a number")
         if self.entry_price < 0:
             raise ValueError(f"entry_price must be >= 0, got {self.entry_price}")
         if not -100 <= self.target_pct <= 1000:
@@ -80,16 +83,19 @@ def calculate_exit_price(entry: float, target_pct: float) -> float:
 
     Args:
         entry: Buy price per share (must be > 0).
-        target_pct: Desired gain as percent (e.g. 5.0 = +5%).
+        target_pct: Desired gain as percent (e.g. 5.0 = +5%). Must be
+            > -100 so the exit price stays positive.
 
     Returns:
         Target exit price, rounded to 2 decimals.
 
     Raises:
-        ValueError: If entry is non-positive.
+        ValueError: If entry is non-positive or target_pct <= -100.
     """
     if entry <= 0:
         raise ValueError(f"entry must be > 0, got {entry}")
+    if target_pct <= -100:
+        raise ValueError(f"target_pct must be > -100, got {target_pct}")
     return round(entry * (1 + target_pct / 100), 2)
 
 

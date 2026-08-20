@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import re
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -16,14 +18,42 @@ from typing import Any
 
 import pandas as pd
 
+from . import db
+
 logger = logging.getLogger(__name__)
 
-CACHE_DIR = Path("cache")
-CACHE_DIR.mkdir(exist_ok=True)
+
+def jst_now() -> datetime:
+    """Current time in Japan Standard Time (market-local).
+
+    The server may run in any timezone (Render defaults to UTC); trading
+    windows, cache freshness and scan dates must be judged in JST.
+    """
+    from zoneinfo import ZoneInfo
+
+    return datetime.now(ZoneInfo("Asia/Tokyo"))
+
+# Matches the trailing "{start}_{end}_{interval}" part of an OHLCV cache
+# filename (e.g. "..._7203_T_2026-01-01_2026-08-17_1d.parquet").
+_CACHE_RANGE_RE = re.compile(
+    r"_(\d{4}-\d{2}-\d{2})_(\d{4}-\d{2}-\d{2})_[a-z0-9]+$",
+    re.IGNORECASE,
+)
+
+# Caches live under DATA_DIR (TSE_DATA_DIR-aware) so they survive redeploys
+# and don't depend on the process CWD (a relative "cache/" would land
+# wherever streamlit happened to be launched).
+CACHE_DIR = db.DATA_DIR / "cache"
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 # Fundamentals cache: JSON files per ticker, 24h expiry
 FUND_CACHE_DIR = CACHE_DIR / "fundamentals"
 FUND_CACHE_DIR.mkdir(exist_ok=True)
+
+# Cache schema version. v1 stored dividend_yield as a percentage (e.g. 3.72)
+# and had no version marker; v2 stores the raw fraction (e.g. 0.0372) and is
+# identified by the `.v2.json` suffix so the value is never re-interpreted.
+FUND_CACHE_VERSION = 2
 
 # In-memory cache for fundamentals to avoid repeated disk reads
 _fund_cache_mem: dict[str, tuple[datetime, dict]] = {}
@@ -88,6 +118,9 @@ class YFinanceDataLoader(BaseDataLoader):
 
     _SUFFIX = ".T"
     _CACHE_EXPIRY_HOURS = 24
+    # Caches whose date range ends today may hold a partial bar; refresh them
+    # frequently so same-day scans (e.g. 15:30 JST post-close) see fresh data.
+    _INTRADAY_CACHE_MINUTES = 30
 
     def normalize_ticker(self, ticker: str) -> str:
         """Append .T if not already present.
@@ -107,14 +140,23 @@ class YFinanceDataLoader(BaseDataLoader):
     # --- OHLCV cache ---
 
     def _cache_path(self, ticker: str, start: str, end: str, interval: str) -> Path:
-        safe = ticker.replace(".", "_")
+        # Underscore-escape so distinct tickers can never collide: "X.Y" ->
+        # "X_Y", "X_Y" -> "X__Y" (dot and underscore both map to underscore
+        # by design, but nested underscores keep them apart).
+        safe = ticker.replace("_", "__").replace(".", "_")
         return CACHE_DIR / f"{safe}_{start}_{end}_{interval}.parquet"
 
     def _is_cache_fresh(self, path: Path) -> bool:
         if not path.exists():
             return False
         mtime = datetime.fromtimestamp(path.stat().st_mtime)
-        return datetime.now() - mtime < timedelta(hours=self._CACHE_EXPIRY_HOURS)
+        age = datetime.now() - mtime
+        m = _CACHE_RANGE_RE.search(path.stem)
+        # "Today" means JST, not server-local: Render runs UTC, so a UTC
+        # midnight boundary would misjudge the trading day by 9 hours.
+        if m and m.group(2) == jst_now().strftime("%Y-%m-%d"):
+            return age < timedelta(minutes=self._INTRADAY_CACHE_MINUTES)
+        return age < timedelta(hours=self._CACHE_EXPIRY_HOURS)
 
     def _evict_stale_cache(self) -> int:
         """Delete OHLCV cache files older than 7 days.
@@ -164,7 +206,14 @@ class YFinanceDataLoader(BaseDataLoader):
 
         if self._is_cache_fresh(cache):
             logger.info("Cache hit: %s", normalized)
-            return pd.read_parquet(cache)
+            try:
+                return pd.read_parquet(cache)
+            except Exception:
+                # A torn/corrupt parquet must not pin the ticker in a
+                # permanent failure loop — freshness says "ok", read fails,
+                # and the fetch branch below never runs. Drop it and refetch.
+                logger.warning("Corrupt cache %s — refetching", cache.name)
+                cache.unlink(missing_ok=True)
 
         logger.info("Fetching OHLCV: %s [%s -> %s]", normalized, start, end)
         try:
@@ -182,15 +231,26 @@ class YFinanceDataLoader(BaseDataLoader):
         if isinstance(data.columns, pd.MultiIndex):
             data.columns = data.columns.get_level_values(0)
 
-        data.to_parquet(cache)
+        # Suspended days yield all-NaN rows; they would poison every
+        # downstream consumer (SMA/RSI, NaN prices passed as real prices).
+        data = data.dropna(subset=["Close"])
+        if data.empty:
+            raise ValueError(f"No valid close prices for {normalized}")
+
+        # Atomic write: temp file + os.replace. Concurrent writers (UI thread
+        # + background scanner) must never leave a truncated parquet behind.
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = cache.with_suffix(".parquet.tmp")
+        data.to_parquet(tmp)
+        os.replace(tmp, cache)
         logger.info("Cached %d bars for %s", len(data), normalized)
         return data
 
     # --- Fundamentals cache (disk + memory) ---
 
     def _fund_cache_path(self, ticker: str) -> Path:
-        safe = ticker.replace(".", "_")
-        return FUND_CACHE_DIR / f"{safe}.json"
+        safe = ticker.replace("_", "__").replace(".", "_")
+        return FUND_CACHE_DIR / f"{safe}.v{FUND_CACHE_VERSION}.json"
 
     def _read_fund_cache(self, ticker: str) -> dict[str, Any] | None:
         """Read fundamentals from memory, then disk cache."""
@@ -208,9 +268,6 @@ class YFinanceDataLoader(BaseDataLoader):
                 cached_at = datetime.fromisoformat(data.get("_cached_at", ""))
                 if datetime.now() - cached_at < timedelta(hours=self._CACHE_EXPIRY_HOURS):
                     result = {k: v for k, v in data.items() if not k.startswith("_")}
-                    # Fix legacy cache: old format stored dividend_yield as percentage (e.g. 3.72)
-                    if result.get("dividend_yield") is not None and result["dividend_yield"] > 0.1:
-                        result["dividend_yield"] = result["dividend_yield"] / 100.0
                     _fund_cache_mem[ticker] = (cached_at, result)
                     return result
             except Exception:
@@ -219,11 +276,17 @@ class YFinanceDataLoader(BaseDataLoader):
         return None
 
     def _write_fund_cache(self, ticker: str, data: dict[str, Any]) -> None:
-        """Write fundamentals to disk + memory cache."""
+        """Write fundamentals to disk + memory cache.
+
+        v1 caches (no version suffix) are dropped — v1 could not distinguish
+        a legacy percentage dividend_yield from a genuine yield > 10%.
+        """
         data_with_ts = {**data, "_cached_at": datetime.now().isoformat()}
         path = self._fund_cache_path(ticker)
         try:
             path.write_text(json.dumps(data_with_ts, default=str))
+            legacy = FUND_CACHE_DIR / f"{ticker.replace('.', '_')}.json"
+            legacy.unlink(missing_ok=True)
         except Exception:
             logger.debug("Fund cache write failed for %s", ticker)
         _fund_cache_mem[ticker] = (datetime.now(), data)
@@ -269,7 +332,10 @@ class YFinanceDataLoader(BaseDataLoader):
                 "industry": info.get("industry"),
             }
 
-        self._write_fund_cache(normalized, result)
+        if info is not None:
+            # Only cache successes — caching an all-None result would pin the
+            # failure for 24h and keep a stock invisible to the screener.
+            self._write_fund_cache(normalized, result)
         return result
 
     def fetch_batch_fundamentals(self, tickers: list[str]) -> dict[str, dict[str, Any]]:

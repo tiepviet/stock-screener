@@ -8,20 +8,30 @@ services:
     startCommand: streamlit run app.py --server.port $PORT --server.address 0.0.0.0
     envVars:
       - key: PYTHON_VERSION
-        value: 3.10.12
+        value: 3.12.10
       - key: TSE_ADMIN_USER
         sync: true
       - key: TSE_ADMIN_PASSWORD
         sync: true
       - key: TSE_JWT_SECRET
         generateValue: true
-      # By default, use local ephemeral data dir. 
-      # Set to /data if a persistent disk is attached.
+      # Default to a local data dir inside the ephemeral filesystem.
+      # The SQLite DB (users, settings, watchlist), JWT secret and caches
+      # are LOST on every redeploy on the free tier — there is no persistent
+      # disk there.
+      #
+      # On Render Starter (paid) or higher, attach a persistent disk and
+      # point TSE_DATA_DIR at its mount so the DB + secret survive redeploys:
+      #   - key: TSE_DATA_DIR
+      #     value: /data
+      #
+      # Requires the disk block below to be uncommented (mountPath: /data).
+      # NOTE: do NOT uncomment the disk on the free tier — Render rejects
+      # deployments that reference a disk there.
       - key: TSE_DATA_DIR
         value: ./data
 
-    # Optional: Uncomment if deploying on Render Paid tier (Starter or higher) 
-    # to persist SQLite database. Free tier does not support persistent disks.
+    # Persistent disk (paid tiers only — Starter or higher):
     # disk:
     #   name: screener-data
     #   mountPath: /data

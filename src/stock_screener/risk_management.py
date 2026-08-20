@@ -11,6 +11,8 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
+import pandas as pd
+
 from .technical_engine import Signal, SignalType
 
 logger = logging.getLogger(__name__)
@@ -88,7 +90,7 @@ class RiskManager:
         """
         if signal.signal_type != SignalType.BUY:
             raise ValueError(f"Position sizing only for BUY signals, got {signal.signal_type}")
-        if signal.price <= 0:
+        if signal.price <= 0 or pd.isna(signal.price):
             raise ValueError(f"Signal price must be positive, got {signal.price}")
 
         entry = signal.price
@@ -120,7 +122,18 @@ class RiskManager:
             shares = max(1, int(risk_amount / risk_per_share))
 
         position_value = shares * entry
-        actual_risk = shares * risk_per_share
+        if position_value > self.total_capital:
+            # Cap at full capital — a tight ATR stop must never lever the
+            # account several times over on a single position.
+            shares = max(1, int(self.total_capital / entry))
+            position_value = shares * entry
+            actual_risk = shares * risk_per_share
+            logger.warning(
+                "%s: position capped at full capital (%d shares, ¥%.0f).",
+                signal.ticker, shares, position_value,
+            )
+        else:
+            actual_risk = shares * risk_per_share
         risk_pct = actual_risk / self.total_capital if self.total_capital > 0 else 0
 
         plan = PositionPlan(
@@ -136,23 +149,32 @@ class RiskManager:
         logger.info("Position: %s", plan)
         return plan
 
-    def batch_positions(self, signals: list[Signal]) -> list[PositionPlan]:
+    def batch_positions(
+        self, signals: list[Signal], max_positions: int = 0
+    ) -> list[PositionPlan]:
         """Calculate positions for multiple BUY signals.
 
         Respects total capital — stops when capital allocation would exceed limit.
+        Signals are processed cheapest-first (greedy, per-unit price); pass
+        `max_positions` to cap the number of simultaneous plans.
 
         Args:
             signals: List of BUY signals.
+            max_positions: Max plans to produce (0 = unlimited).
 
         Returns:
             List of PositionPlan objects.
         """
+        if max_positions < 0:
+            raise ValueError("max_positions must be >= 0")
         plans: list[PositionPlan] = []
         allocated = 0.0
 
         for sig in sorted(signals, key=lambda s: s.price):
             if sig.signal_type.value != "BUY":
                 continue
+            if max_positions and len(plans) >= max_positions:
+                break
             plan = self.calculate_position(sig)
             if plan.shares == 0:
                 continue
@@ -181,6 +203,11 @@ class RiskManager:
         Returns:
             'STOP_LOSS' if triggered, None otherwise.
         """
+        if pd.isna(current_price):
+            # NaN price (stale/unknown) must not silently count as "no stop
+            # hit" — but it also can't trigger. Log and move on.
+            logger.debug("%s: NaN price — stop check skipped", position.ticker)
+            return None
         if current_price <= position.stop_loss:
             logger.warning(
                 "STOP LOSS TRIGGERED: %s @ %.2f (SL=%.2f)",
@@ -216,6 +243,8 @@ class TrailingStopState:
         Returns:
             Updated stop loss price.
         """
+        if pd.isna(current_price):
+            return self.current_stop
         if current_price > self.highest_price:
             self.highest_price = current_price
             new_stop = round(current_price * (1 - self.trail_pct), 2)
@@ -236,6 +265,8 @@ class TrailingStopState:
         Returns:
             'TRAILING_STOP' if triggered, None otherwise.
         """
+        if pd.isna(current_price):
+            return None
         if current_price <= self.current_stop:
             logger.warning(
                 "TRAILING STOP TRIGGERED: %s @ %.2f (SL=%.2f, highest=%.2f)",

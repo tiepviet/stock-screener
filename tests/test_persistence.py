@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import os
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import jwt
@@ -112,6 +112,139 @@ def test_change_password(_isolated_db: None) -> None:
     assert auth.verify_user("alice", "newpass2") is not None
 
 
+# --- P5: rate limiting + token revocation ---
+
+
+def test_attempt_login_success(_isolated_db: None) -> None:
+    auth.create_user("alice", "secret123")
+    rec, err = auth.attempt_login("alice", "secret123", ip="1.2.3.4")
+    assert err is None
+    assert rec is not None
+    assert rec.username == "alice"
+
+
+def test_attempt_login_wrong_password_records_failure(_isolated_db: None) -> None:
+    auth.create_user("alice", "secret123")
+    rec, err = auth.attempt_login("alice", "wrong-pw", ip="1.2.3.4")
+    assert rec is None
+    assert err == "invalid"
+
+
+def test_attempt_login_locks_out_after_max_failures(_isolated_db: None) -> None:
+    auth.create_user("alice", "secret123")
+    for i in range(auth.MAX_FAILED_ATTEMPTS):
+        rec, err = auth.attempt_login("alice", "wrong-pw", ip="1.2.3.4")
+        assert err == "invalid"
+    # The next attempt — even with the CORRECT password — is locked out
+    rec, err = auth.attempt_login("alice", "secret123", ip="1.2.3.4")
+    assert rec is None
+    assert err == "locked"
+
+
+def test_attempt_login_lockout_is_per_username_and_ip(_isolated_db: None) -> None:
+    auth.create_user("alice", "secret123")
+    for i in range(auth.MAX_FAILED_ATTEMPTS):
+        auth.attempt_login("alice", "wrong-pw", ip="1.2.3.4")
+    # Different IP → not locked out
+    rec, err = auth.attempt_login("alice", "secret123", ip="9.9.9.9")
+    assert err is None
+    assert rec is not None
+    # Different user on the same IP → not locked out
+    auth.create_user("bob", "secret123")
+    rec, err = auth.attempt_login("bob", "secret123", ip="1.2.3.4")
+    assert err is None
+    assert rec is not None
+
+
+def test_attempt_login_empty_credentials_not_recorded(_isolated_db: None) -> None:
+    auth.create_user("alice", "secret123")
+    rec, err = auth.attempt_login("", "", ip="1.2.3.4")
+    assert rec is None
+    assert err == "invalid"
+    # Empty attempts must not consume the lockout budget
+    for i in range(auth.MAX_FAILED_ATTEMPTS):
+        auth.attempt_login("alice", "badpass1", ip="1.2.3.4")
+    rec, err = auth.attempt_login("alice", "badpass1", ip="1.2.3.4")
+    assert err == "locked"  # still exactly MAX_FAILED_ATTEMPTS on record
+
+
+def test_token_version_starts_zero_and_increments(_isolated_db: None) -> None:
+    rec = auth.create_user("alice", "secret123")
+    assert auth.get_token_version(rec.id) == 0
+    assert auth.increment_token_version(rec.id) == 1
+    assert auth.get_token_version(rec.id) == 1
+
+
+def test_token_version_embedded_in_jwt(_isolated_db: None) -> None:
+    rec = auth.create_user("alice", "secret123")
+    token = jwt_auth.create_token(rec.id, rec.username)
+    payload = jwt_auth.verify_token(token)
+    assert payload["tv"] == 0
+    token2 = jwt_auth.create_token(
+        rec.id, rec.username, token_version=auth.increment_token_version(rec.id)
+    )
+    assert jwt_auth.verify_token(token2)["tv"] == 1
+
+
+def test_change_password_bumps_token_version(_isolated_db: None) -> None:
+    rec = auth.create_user("alice", "secret123")
+    assert auth.get_token_version(rec.id) == 0
+    auth.change_password(rec.id, "newpass2")
+    assert auth.get_token_version(rec.id) == 1
+
+
+def test_migration_adds_token_version_to_legacy_db(tmp_path: Path) -> None:
+    """Pre-existing DBs without token_version must be upgraded by init_db."""
+    legacy = tmp_path / "legacy.db"
+    import sqlite3
+
+    with sqlite3.connect(legacy) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            INSERT INTO users (username, password_hash, created_at)
+            VALUES ('legacy', 'x', 'now');
+            """
+        )
+    db.init_db(legacy)
+    with sqlite3.connect(legacy) as conn:
+        row = conn.execute(
+            "SELECT token_version FROM users WHERE username='legacy'"
+        ).fetchone()
+    assert row[0] == 0
+
+
+def test_connect_migrates_existing_legacy_db(tmp_path: Path) -> None:
+    """P5: connect() on an EXISTING legacy DB must apply migrations too —
+    the app flow relies on it when the file already exists."""
+    legacy = tmp_path / "legacy-connect.db"
+    import sqlite3
+
+    with sqlite3.connect(legacy) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            INSERT INTO users (username, password_hash, created_at)
+            VALUES ('legacy', 'x', 'now');
+            """
+        )
+    with db.connect(legacy) as conn:
+        row = conn.execute(
+            "SELECT token_version FROM users WHERE username='legacy'"
+        ).fetchone()
+    assert row["token_version"] == 0
+
+
 def test_password_is_hashed_not_plain(_isolated_db: None) -> None:
     auth.create_user("alice", "secret123")
     with db.connect() as conn:
@@ -133,7 +266,7 @@ def test_create_and_verify_token(_isolated_db: None) -> None:
 
 def test_verify_expired_token(_isolated_db: None) -> None:
     # Issue a token that's already expired
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     payload = {
         "sub": "1", "username": "x", "iss": jwt_auth._ISSUER,
         "iat": int((now - timedelta(days=40)).timestamp()),

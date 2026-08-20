@@ -172,6 +172,15 @@ class PriceTargetEngine:
             )
 
         last_close = float(df["Close"].iloc[-1])
+        if pd.isna(last_close) or last_close <= 0:
+            # No valid close — only proceed when the caller supplied an entry.
+            if not entry_price or pd.isna(float(entry_price)) or float(entry_price) <= 0:
+                return PriceTargets(
+                    ticker=ticker,
+                    current_price=0.0,
+                    reasoning="No valid close price (NaN) — cannot compute targets",
+                )
+            last_close = float(entry_price)
         entry = entry_price or last_close
 
         # Compute components
@@ -267,7 +276,13 @@ class PriceTargetEngine:
         cluster: list[float] = [sorted_levels[0]]
 
         for i in range(1, len(sorted_levels)):
-            if (sorted_levels[i] - cluster[0]) / cluster[0] <= threshold_pct:
+            base = cluster[0]
+            if base == 0:
+                # Relative diff is undefined for a 0 base — use absolute distance
+                same_cluster = abs(sorted_levels[i] - base) <= threshold_pct
+            else:
+                same_cluster = (sorted_levels[i] - base) / base <= threshold_pct
+            if same_cluster:
                 cluster.append(sorted_levels[i])
             else:
                 clustered.append(round(sum(cluster) / len(cluster), 2))
@@ -287,6 +302,8 @@ class PriceTargetEngine:
 
         swing_low = float(recent["Low"].min())
         swing_high = float(recent["High"].max())
+        if pd.isna(swing_low) or pd.isna(swing_high) or swing_high <= swing_low:
+            return FibonacciLevels(swing_low=swing_low, swing_high=swing_high)
 
         fib = FibonacciLevels(swing_low=swing_low, swing_high=swing_high)
 

@@ -111,11 +111,15 @@ class MultiTimeframeConfirmer:
         for sig in daily_signals:
             confidence = 0.5  # base confidence (daily only)
 
-            # Weekly trend confirmation: +0.3
-            if weekly_trend_up:
+            # Weekly trend confirmation: +0.3 — only when the weekly trend
+            # AGREES with the signal direction (a bullish weekly must not
+            # boost a SELL signal; contradictory = no boost).
+            if (weekly_trend_up and sig.signal_type == SignalType.BUY) or (
+                not weekly_trend_up and sig.signal_type == SignalType.SELL
+            ):
                 confidence += 0.3
 
-            # Check if daily trend also aligns: +0.2
+            # Check if daily trend also aligns: +0.2 (BUY only — see above)
             daily_trend_up = self._check_daily_trend(daily_df, sig.date)
             if daily_trend_up and sig.signal_type == SignalType.BUY:
                 confidence += 0.2
@@ -150,11 +154,13 @@ class MultiTimeframeConfirmer:
         Returns:
             List of confirmed signals across all tickers.
         """
-        from datetime import datetime, timedelta
+        from datetime import timedelta
 
-        end = datetime.now().strftime("%Y-%m-%d")
-        start = datetime.now() - timedelta(days=lookback_days)
-        weekly_start = datetime.now() - timedelta(days=lookback_days * 2)
+        from .data_loader import jst_now
+
+        end = jst_now().strftime("%Y-%m-%d")
+        start = jst_now() - timedelta(days=lookback_days)
+        weekly_start = jst_now() - timedelta(days=lookback_days * 2)
 
         all_confirmed: list[ConfirmedSignal] = []
 
@@ -186,20 +192,38 @@ class MultiTimeframeConfirmer:
             return False
         if "SMA_20" not in weekly_df.columns:
             return False
-        last_close = float(weekly_df["Close"].iloc[-1])
-        last_sma20 = float(weekly_df["SMA_20"].iloc[-1])
-        if pd.isna(last_sma20):
+        # float(NaN) raises — check before converting
+        last_close = weekly_df["Close"].iloc[-1]
+        last_sma20 = weekly_df["SMA_20"].iloc[-1]
+        if pd.isna(last_close) or pd.isna(last_sma20):
             return False
-        return last_close > last_sma20
+        return float(last_close) > float(last_sma20)
 
     def _check_daily_trend(self, daily_df: pd.DataFrame, signal_date) -> bool:
-        """Check if daily trend is bullish at signal date (close > SMA_50)."""
-        if "SMA_50" not in daily_df.columns:
+        """Check if daily trend is bullish at signal date (close > SMA_50).
+
+        Signal dates may carry a time component (from ``to_pydatetime()``)
+        while the index holds midnight timestamps — try an exact match first,
+        then a normalized match, then fall back to the most recent bar at or
+        before the signal date. A failed lookup returns False (no boost).
+        """
+        if "SMA_50" not in daily_df.columns or daily_df.empty:
             return False
+        ts = pd.Timestamp(signal_date)
+        if pd.isna(ts):
+            return False
+        if ts in daily_df.index:
+            row = daily_df.loc[ts]
+        else:
+            ts_norm = ts.normalize()
+            if ts_norm in daily_df.index:
+                row = daily_df.loc[ts_norm]
+            else:
+                idx = daily_df.index.asof(ts_norm)
+                if pd.isna(idx):
+                    return False
+                row = daily_df.loc[idx]
         try:
-            if signal_date in daily_df.index:
-                row = daily_df.loc[signal_date]
-                return float(row["Close"]) > float(row["SMA_50"])
-        except Exception:
-            pass
-        return False
+            return float(row["Close"]) > float(row["SMA_50"])
+        except (TypeError, ValueError):
+            return False

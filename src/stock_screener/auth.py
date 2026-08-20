@@ -18,8 +18,11 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import re
+import secrets
 import sys
 from dataclasses import dataclass
+from datetime import UTC
 from pathlib import Path
 
 import bcrypt
@@ -48,6 +51,12 @@ logger = logging.getLogger(__name__)
 
 _MIN_PW_LEN = 8
 
+# Brute-force protection: after MAX_FAILED_ATTEMPTS failed logins for the
+# same (username, ip) pair inside LOCKOUT_WINDOW, further attempts are
+# rejected until the window slides past.
+MAX_FAILED_ATTEMPTS = 5
+LOCKOUT_WINDOW_MINUTES = 15
+
 
 @dataclass
 class UserRecord:
@@ -56,16 +65,43 @@ class UserRecord:
 
 
 def hash_password(plain: str) -> str:
-    """Return a bcrypt hash as a UTF-8 string (safe to store in TEXT)."""
+    """Return a bcrypt hash as a UTF-8 string (safe to store in TEXT).
+
+    Raises:
+        ValueError: If password too short OR longer than 72 bytes — bcrypt
+            silently truncates beyond 72 bytes, so "abc...xyz" and its
+            truncated prefix would verify as equal.
+    """
     if not plain or len(plain) < _MIN_PW_LEN:
         raise ValueError(f"Password must be at least {_MIN_PW_LEN} characters")
+    if len(plain.encode("utf-8")) > 72:
+        raise ValueError("Password must be at most 72 bytes (UTF-8)")
     salt = bcrypt.gensalt(rounds=12)
     return bcrypt.hashpw(plain.encode("utf-8"), salt).decode("utf-8")
 
 
+# Precomputed bcrypt hash for a random password — used on unknown-username
+# logins so bcrypt work (12 rounds) still runs, keeping the "user exists"
+# check indistinguishable in timing from a wrong-password check. Generated
+# once at import; "x"*53 in the old code failed the base64 decode FAST and
+# leaked timing.
+_DUMMY_HASH = bcrypt.hashpw(
+    secrets.token_bytes(32), bcrypt.gensalt(rounds=12)
+).decode("utf-8")
+
+_BCRYPT_RE = re.compile(r"^\$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}$")
+
+
 def verify_password(plain: str, hashed: str) -> bool:
-    """Constant-time bcrypt comparison. Returns False on any decode error."""
-    if not plain or not hashed:
+    """Constant-time bcrypt comparison. Returns False on any decode error.
+
+    Format is validated first — a corrupt stored hash otherwise makes the
+    bcrypt Rust crate panic (pyo3_runtime.PanicException) which is neither
+    a ValueError nor TypeError and would 500 the login route.
+    """
+    if not plain or not hashed or len(plain.encode("utf-8")) > 72:
+        return False
+    if not _BCRYPT_RE.match(hashed):
         return False
     try:
         return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
@@ -82,9 +118,9 @@ def create_user(username: str, password: str) -> UserRecord:
         raise ValueError(f"Password must be at least {_MIN_PW_LEN} characters")
 
     pw_hash = hash_password(password)
-    from datetime import datetime, timezone
+    from datetime import datetime
 
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     try:
         with db.connect() as conn:
             cur = conn.execute(
@@ -122,19 +158,101 @@ def verify_user(username: str, password: str) -> UserRecord | None:
         ).fetchone()
     if row is None:
         # Constant-time-ish: still hash a dummy to avoid timing leak on user enumeration
-        verify_password(password, "$2b$12$" + "x" * 53)
+        verify_password(password, _DUMMY_HASH)
         return None
     if not verify_password(password, str(row["password_hash"])):
         return None
     return UserRecord(id=int(row["id"]), username=str(row["username"]))
 
 
+def _prune_login_attempts(conn, cutoff_iso: str) -> None:
+    """Delete attempt rows older than the cutoff. Called on each record."""
+    conn.execute(
+        "DELETE FROM login_attempts WHERE attempted_at < ?",
+        (cutoff_iso,),
+    )
+
+
+def _failed_count(conn, username: str, ip: str, since_iso: str) -> int:
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM login_attempts "
+        "WHERE username = ? AND ip = ? AND success = 0 AND attempted_at >= ?",
+        (username, ip, since_iso),
+    ).fetchone()
+    return int(row["n"])
+
+
+def attempt_login(
+    username: str, password: str, ip: str = "unknown"
+) -> tuple[UserRecord | None, str | None]:
+    """Rate-limited credential check. Returns (record, error).
+
+    ``error`` is None on success, "invalid" for wrong credentials, or
+    "locked" when too many failures accumulated for this (username, ip)
+    pair. Every attempt is recorded so the lockout window slides.
+    """
+    username = (username or "").strip()
+    if not username or not password:
+        return None, "invalid"
+
+    from datetime import datetime, timedelta
+
+    now = datetime.now(UTC)
+    window_start = (now - timedelta(minutes=LOCKOUT_WINDOW_MINUTES)).isoformat()
+
+    with db.connect() as conn:
+        if _failed_count(conn, username, ip, window_start) >= MAX_FAILED_ATTEMPTS:
+            logger.warning(
+                "Login rate-limited for user '%s' ip=%s (>=%d failures in %dm)",
+                username, ip, MAX_FAILED_ATTEMPTS, LOCKOUT_WINDOW_MINUTES,
+            )
+            return None, "locked"
+        rec = verify_user(username, password)
+        conn.execute(
+            "INSERT INTO login_attempts (username, ip, success, attempted_at) "
+            "VALUES (?, ?, ?, ?)",
+            (username, ip, 1 if rec is not None else 0, now.isoformat()),
+        )
+        _prune_login_attempts(conn, window_start)
+    return (rec, None) if rec is not None else (None, "invalid")
+
+
+def get_token_version(user_id: int) -> int:
+    """Current token version for a user (0 = never revoked)."""
+    with db.connect() as conn:
+        row = conn.execute(
+            "SELECT token_version FROM users WHERE id = ?", (user_id,)
+        ).fetchone()
+    if row is None:
+        raise KeyError(f"User id={user_id} not found")
+    return int(row["token_version"])
+
+
+def increment_token_version(user_id: int) -> int:
+    """Bump the user's token version, revoking every previously issued JWT.
+
+    Returns the new version. Call on logout and after password changes.
+    """
+    with db.connect() as conn:
+        conn.execute(
+            "UPDATE users SET token_version = token_version + 1 WHERE id = ?",
+            (user_id,),
+        )
+        row = conn.execute(
+            "SELECT token_version FROM users WHERE id = ?", (user_id,)
+        ).fetchone()
+    if row is None:
+        raise KeyError(f"User id={user_id} not found")
+    return int(row["token_version"])
+
+
 def change_password(user_id: int, new_password: str) -> None:
-    """Update a user's password hash."""
+    """Update a user's password hash and revoke all outstanding sessions."""
     new_hash = hash_password(new_password)
     with db.connect() as conn:
         conn.execute(
-            "UPDATE users SET password_hash = ? WHERE id = ?",
+            "UPDATE users SET password_hash = ?, token_version = token_version + 1 "
+            "WHERE id = ?",
             (new_hash, user_id),
         )
 

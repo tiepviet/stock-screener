@@ -53,8 +53,9 @@ class Condition:
             data: Dict of fundamental metrics (from data_loader).
 
         Returns:
-            True if condition passes. Missing values fail the check
-            (strict — prevents stocks with no fundamental data from passing).
+            True if condition passes. Missing values and unknown operators
+            fail the check (fail-closed — a broken condition must never pass
+            a stock, and stocks without fundamental data must not pass).
         """
         val = data.get(self.metric)
         if val is None:
@@ -64,9 +65,14 @@ class Condition:
             logger.warning("Unknown operator '%s', condition fails", self.operator)
             return False
         try:
-            return op_func(float(val), self.value)
+            f = float(val)
         except (TypeError, ValueError):
             return False
+        # NaN (or NaN-like missing data) must fail every condition — the
+        # '!=' operator would otherwise pass: NaN != x is always True.
+        if pd.isna(f):
+            return False
+        return op_func(f, self.value)
 
 
 # ---------------------------------------------------------------------------
@@ -120,7 +126,9 @@ class FundamentalScreener:
         rows: list[dict] = []
 
         for ticker in tickers:
-            fundies = all_fundies.get(ticker, {})
+            # Copy — the dicts come from the loader's shared cache and must
+            # not be mutated (a stray 'ticker' key would leak into cache data).
+            fundies = dict(all_fundies.get(ticker, {}))
             fundies["ticker"] = ticker
 
             if all(c.evaluate(fundies) for c in conditions):

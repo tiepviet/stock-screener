@@ -18,12 +18,22 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from . import db
 
 logger = logging.getLogger(__name__)
+
+
+def _canonical(ticker: str) -> str:
+    """Strip exchange suffix so "7203.T" and "7203" are one ticker.
+
+    Watchlist/target rows are compared against raw UI input ("7203"),
+    so storing "7203.T" would let the same issue exist twice.
+    """
+    t = (ticker or "").strip().upper()
+    return t[:-2] if t.endswith(".T") else t
 
 
 # ---------------------------------------------------------------------------
@@ -86,7 +96,7 @@ def save_target_rows(user_id: int, rows: list[dict]) -> None:
         payload.append((
             user_id,
             i,
-            str(r.get("ticker", "")).strip().upper(),
+            _canonical(r.get("ticker", "")),
             float(r.get("entry_price", 0) or 0),
             float(r.get("target_pct", 0) or 0),
             int(r.get("shares", 0) or 0),
@@ -116,10 +126,10 @@ def get_watchlist(user_id: int) -> list[str]:
 
 
 def add_to_watchlist(user_id: int, ticker: str) -> None:
-    ticker = (ticker or "").strip().upper()
+    ticker = _canonical(ticker)
     if not ticker:
         return
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     with db.connect() as conn:
         conn.execute(
             "INSERT OR IGNORE INTO watchlist (user_id, ticker, added_at) "
@@ -129,7 +139,7 @@ def add_to_watchlist(user_id: int, ticker: str) -> None:
 
 
 def remove_from_watchlist(user_id: int, ticker: str) -> None:
-    ticker = (ticker or "").strip().upper()
+    ticker = _canonical(ticker)
     with db.connect() as conn:
         conn.execute(
             "DELETE FROM watchlist WHERE user_id = ? AND ticker = ?",

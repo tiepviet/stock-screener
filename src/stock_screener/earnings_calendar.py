@@ -14,7 +14,7 @@ from datetime import datetime
 
 import pandas as pd
 
-from .data_loader import BaseDataLoader, YFinanceDataLoader
+from .data_loader import BaseDataLoader, YFinanceDataLoader, jst_now
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +74,7 @@ class EarningsCalendar:
                 return info
 
             # calendar can be a dict or DataFrame depending on yfinance version
-            now = datetime.now()
+            now = jst_now().replace(tzinfo=None)
             now_date = now.date()
             if isinstance(cal, dict):
                 earn_date = cal.get("Earnings Date")
@@ -115,9 +115,18 @@ class EarningsCalendar:
         except Exception:
             logger.exception("Failed to fetch earnings for %s", normalized)
 
-        # Calculate days until earnings
+        # Calculate days until earnings (JST calendar day — a UTC host would
+        # otherwise misjudge "today/tomorrow" by up to 9 hours)
         if info.next_earnings_date:
-            delta = info.next_earnings_date - datetime.now()
+            from zoneinfo import ZoneInfo
+
+            now = jst_now().replace(tzinfo=None)
+            ed = info.next_earnings_date
+            if isinstance(ed, pd.Timestamp):
+                ed = ed.to_pydatetime()
+            if ed.tzinfo is not None:
+                ed = ed.astimezone(ZoneInfo("Asia/Tokyo")).replace(tzinfo=None)
+            delta = ed - now
             info.days_until_earnings = delta.days
             info.is_upcoming = 0 <= delta.days <= self.warning_days
 
@@ -138,6 +147,8 @@ class EarningsCalendar:
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
         results: dict[str, EarningsInfo] = {}
+        if not tickers:
+            return results
         with ThreadPoolExecutor(max_workers=min(len(tickers), 8)) as pool:
             futures = {pool.submit(self.get_earnings, t): t for t in tickers}
             for future in as_completed(futures):

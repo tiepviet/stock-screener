@@ -23,7 +23,7 @@ from __future__ import annotations
 import logging
 import os
 import secrets
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import jwt
@@ -62,15 +62,21 @@ def create_token(
     username: str,
     days_valid: int = _TOKEN_DAYS,
     secret: str | None = None,
+    token_version: int = 0,
 ) -> str:
-    """Create a signed JWT for the given user. Default lifetime: 30 days."""
-    now = datetime.now(timezone.utc)
+    """Create a signed JWT for the given user. Default lifetime: 30 days.
+
+    `token_version` is embedded as "tv"; call sites cross-check it against
+    the DB so tokens become invalid after logout / password change.
+    """
+    now = datetime.now(UTC)
     payload = {
         "sub": str(user_id),
         "username": username,
         "iss": _ISSUER,
         "iat": int(now.timestamp()),
         "exp": int((now + timedelta(days=days_valid)).timestamp()),
+        "tv": int(token_version),
     }
     key = secret or _load_or_create_secret()
     return jwt.encode(payload, key, algorithm=_ALGO)
@@ -106,6 +112,12 @@ def rotate_secret(path: Path | None = None) -> Path:
     """Force a new secret. Invalidates all existing tokens (next page
     load will redirect to the login form)."""
     p = path or _SECRET_PATH
+    if os.environ.get("TSE_JWT_SECRET"):
+        logger.warning(
+            "rotate_secret is a no-op: TSE_JWT_SECRET env var overrides the "
+            "file secret. Unset it and rotate the env value to invalidate tokens."
+        )
+        return p
     if p.exists():
         p.unlink()
     _load_or_create_secret(p)

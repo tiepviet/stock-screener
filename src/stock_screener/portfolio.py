@@ -10,18 +10,21 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
-from pathlib import Path
 
 import pandas as pd
 
-from .data_loader import YFinanceDataLoader
+from . import db
+from .data_loader import YFinanceDataLoader, jst_now
 from .risk_management import PositionPlan
 
 logger = logging.getLogger(__name__)
 
-PORTFOLIO_FILE = Path(__file__).parent.parent.parent / "portfolio.json"
+# Persist next to the SQLite DB — survives redeploys on Render paid tier
+# (TSE_DATA_DIR) and keeps state colocated instead of polluting repo root.
+PORTFOLIO_FILE = db.DATA_DIR / "portfolio.json"
 
 
 # ---------------------------------------------------------------------------
@@ -61,10 +64,10 @@ class PortfolioPosition:
         """Update current price and recalculate P/L.
 
         Raises:
-            ValueError: If price is negative.
+            ValueError: If price is negative or NaN.
         """
-        if price < 0:
-            raise ValueError(f"Price must be non-negative, got {price}")
+        if price < 0 or pd.isna(price):
+            raise ValueError(f"Price must be a non-negative number, got {price}")
         self.current_price = price
         self.unrealized_pnl = (price - self.entry_price) * self.shares
         self.unrealized_pnl_pct = (price - self.entry_price) / self.entry_price
@@ -178,7 +181,12 @@ class PortfolioTracker:
             "closed_trades": self.closed_trades,
             "updated_at": datetime.now().isoformat(),
         }
-        PORTFOLIO_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+        # Atomic write: temp file + os.replace — a crash mid-write can never
+        # leave a truncated portfolio.json (which _load silently discards).
+        PORTFOLIO_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = PORTFOLIO_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+        os.replace(tmp, PORTFOLIO_FILE)
 
     # --- Position management ---
 
@@ -201,6 +209,12 @@ class PortfolioTracker:
             logger.warning("Position for %s already exists — skipping", plan.ticker)
             return
 
+        # A 0-share plan (RiskManager's "no capital left" fallback) would
+        # create a phantom position that skews sector exposure and stats.
+        if plan.shares <= 0:
+            logger.warning("Skipping %s: 0-share plan", plan.ticker)
+            return
+
         if not sector:
             try:
                 fundies = self.loader.fetch_fundamentals(plan.ticker)
@@ -213,7 +227,7 @@ class PortfolioTracker:
             ticker=plan.ticker,
             shares=plan.shares,
             entry_price=plan.entry_price,
-            entry_date=datetime.now().strftime("%Y-%m-%d"),
+            entry_date=jst_now().strftime("%Y-%m-%d"),
             stop_loss=plan.stop_loss,
             strategy=plan.strategy,
             sector=sector or "Unknown",
@@ -239,6 +253,11 @@ class PortfolioTracker:
             logger.warning("No position for %s", ticker)
             return
 
+        # Validate BEFORE mutating — popping first then raising on a bad
+        # exit_price would lose the position in memory with nothing saved.
+        if exit_price <= 0 or pd.isna(exit_price):
+            raise ValueError(f"exit_price must be a positive number, got {exit_price}")
+
         pos = self.positions.pop(ticker)
         pos.update_price(exit_price)
         pnl = pos.unrealized_pnl
@@ -250,7 +269,7 @@ class PortfolioTracker:
             "entry_price": pos.entry_price,
             "entry_date": pos.entry_date,
             "exit_price": exit_price,
-            "exit_date": datetime.now().strftime("%Y-%m-%d"),
+            "exit_date": jst_now().strftime("%Y-%m-%d"),
             "pnl": round(pnl, 2),
             "pnl_pct": round(pnl_pct, 4),
             "strategy": pos.strategy,
@@ -268,14 +287,14 @@ class PortfolioTracker:
         """
         if ticker not in self.positions:
             return []
-        from datetime import datetime, timedelta
+        from datetime import timedelta
 
         from .price_target import PriceTargetEngine
         from .technical_engine import TechnicalEngine
 
         pos = self.positions[ticker]
-        end = datetime.now().strftime("%Y-%m-%d")
-        start = (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")
+        end = jst_now().strftime("%Y-%m-%d")
+        start = (jst_now() - timedelta(days=365)).strftime("%Y-%m-%d")
         try:
             df = self.loader.fetch_ohlcv(ticker, start, end)
             df = TechnicalEngine().enrich(df)
@@ -328,6 +347,8 @@ class PortfolioTracker:
                 logger.exception("Failed to update price for %s", ticker)
 
         items = list(self.positions.items())
+        if not items:
+            return
         with ThreadPoolExecutor(max_workers=min(len(items), 8)) as pool:
             for ticker, pos in items:
                 pool.submit(_update_one, ticker, pos)

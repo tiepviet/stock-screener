@@ -117,3 +117,66 @@ def test_confirm_empty_daily_returns_empty() -> None:
     confirmed = confirmer.confirm("TEST", daily, weekly)
     # Flat data shouldn't generate signals
     assert isinstance(confirmed, list)
+
+
+def test_daily_trend_matches_datetime_with_time_component() -> None:
+    """P1: signal dates carrying a time component must still match the
+    midnight-indexed daily frame (previously a silent False)."""
+    from datetime import datetime
+
+    import numpy as np
+
+    n = 60
+    dates = pd.date_range(end=datetime(2024, 6, 24), periods=n, freq="B")
+    close = np.linspace(100, 200, n)
+    daily = pd.DataFrame(
+        {
+            "Open": close + 0.5,
+            "High": close + 1.5,
+            "Low": close - 1.5,
+            "Close": close,
+            "Volume": np.full(n, 500_000.0),
+        },
+        index=dates,
+    )
+    engine = TechnicalEngine()
+    daily = engine.enrich(daily)
+
+    confirmer = MultiTimeframeConfirmer(min_confidence=0.0)
+    # 15:00 — a time component that used to break the `in` membership check
+    signal_date = datetime(2024, 6, 20, 15, 0)
+    assert confirmer._check_daily_trend(daily, signal_date) is True
+
+    # Weekend date not in index → asof fallback to Friday's bar
+    weekend = datetime(2024, 6, 22, 9, 30)  # Saturday
+    assert confirmer._check_daily_trend(daily, weekend) is True
+
+
+def test_daily_trend_safe_on_weird_dates() -> None:
+    """P1: dates before data start or missing must return False, not crash."""
+    from datetime import datetime
+
+    import numpy as np
+
+    n = 60
+    dates = pd.date_range(end=datetime(2024, 6, 24), periods=n, freq="B")
+    close = np.linspace(100, 200, n)
+    daily = pd.DataFrame(
+        {
+            "Open": close + 0.5,
+            "High": close + 1.5,
+            "Low": close - 1.5,
+            "Close": close,
+            "Volume": np.full(n, 500_000.0),
+        },
+        index=dates,
+    )
+    engine = TechnicalEngine()
+    daily = engine.enrich(daily)
+
+    confirmer = MultiTimeframeConfirmer(min_confidence=0.0)
+    # Before the first bar: asof returns NaT — must be handled
+    assert confirmer._check_daily_trend(daily, datetime(2020, 1, 1)) is False
+    # None / NaT signal dates
+    assert confirmer._check_daily_trend(daily, None) is False
+    assert confirmer._check_daily_trend(daily, pd.NaT) is False

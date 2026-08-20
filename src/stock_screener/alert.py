@@ -16,7 +16,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 import requests
 
@@ -31,13 +31,9 @@ from .technical_engine import (
     TrendBreakdownSellStrategy,
     VolumeBreakoutStrategy,
 )
+from .watchlist import DEFAULT_TICKERS
 
 logger = logging.getLogger(__name__)
-
-# Default watchlist (user's tickers)
-USER_TICKERS = ["6232", "6227", "5801", "7974", "4661", "8001", "9433", "2962", "584A", "6327"]
-AI_TICKERS = ["9984", "5803", "6857", "8035", "5016", "285A", "7735"]
-DEFAULT_TICKERS = USER_TICKERS + AI_TICKERS
 
 
 # ---------------------------------------------------------------------------
@@ -273,8 +269,12 @@ class AlertScanner:
         """
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        end = datetime.now().strftime("%Y-%m-%d")
-        start = (datetime.now() - timedelta(days=self.lookback_days)).strftime("%Y-%m-%d")
+        # JST market dates — UTC server would pick the wrong trading day
+        from .data_loader import jst_now
+
+        now = jst_now()
+        end = now.strftime("%Y-%m-%d")
+        start = (now - timedelta(days=self.lookback_days)).strftime("%Y-%m-%d")
         results: dict[str, list[Signal]] = {}
 
         with ThreadPoolExecutor(max_workers=min(len(self.tickers), 8)) as pool:
@@ -292,12 +292,24 @@ class AlertScanner:
             Dict mapping ticker -> list of signals.
         """
         results = self.scan()
-        scan_date = datetime.now().strftime("%Y-%m-%d %H:%M")
+        from .data_loader import jst_now
+
+        scan_date = jst_now().strftime("%Y-%m-%d %H:%M")
 
         # Send combined report (summary includes all signals)
         summary = format_summary_report(results, scan_date)
-        self.telegram_sender.send(summary)
-        self.slack_sender.send(summary)
+        sent = sum(
+            1
+            for sender in (self.telegram_sender, self.slack_sender)
+            if sender.send(summary)
+        )
+        if sent == 0:
+            logger.warning(
+                "No alert channels delivered the report (%d signals, %d tickers) — "
+                "check TELEGRAM/SLACK env config",
+                sum(len(v) for v in results.values()),
+                len(results),
+            )
 
         return results
 
@@ -328,7 +340,12 @@ def run_daemon(tickers: list[str], lookback: int = 365) -> None:
     logger.info("Watching: %s", ", ".join(tickers))
 
     while True:
-        schedule.run_pending()
+        try:
+            schedule.run_pending()
+        except Exception:
+            # A failing job must never kill the daemon — log and keep polling
+            # so the next scheduled run still fires.
+            logger.exception("Scheduled scan failed; daemon continues")
         time.sleep(60)
 
 
@@ -353,7 +370,9 @@ def main() -> None:
     else:
         scanner = AlertScanner(tickers=args.tickers, lookback_days=args.lookback)
         results = scanner.scan_and_alert()
-        scan_date = datetime.now().strftime("%Y-%m-%d %H:%M")
+        from .data_loader import jst_now
+
+        scan_date = jst_now().strftime("%Y-%m-%d %H:%M")
         summary = format_summary_report(results, scan_date)
         print(summary)
 

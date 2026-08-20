@@ -20,6 +20,16 @@ from pathlib import Path
 # Project root: src/stock_screener/db.py -> ../../
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
+# Load .env BEFORE reading env vars below. auth.py also loads it, but this
+# module may be imported first — without the local load, TSE_DATA_DIR from
+# .env would be invisible and state would land in repo root.
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(PROJECT_ROOT / ".env", override=False)
+except ImportError:
+    pass
+
 # Allow overriding data directory and database path via environment variables
 env_data_dir = os.environ.get("TSE_DATA_DIR")
 if env_data_dir:
@@ -43,7 +53,8 @@ CREATE TABLE IF NOT EXISTS users (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     username      TEXT    UNIQUE NOT NULL,
     password_hash TEXT    NOT NULL,
-    created_at    TEXT    NOT NULL
+    created_at    TEXT    NOT NULL,
+    token_version INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS user_settings (
@@ -75,6 +86,17 @@ CREATE TABLE IF NOT EXISTS watchlist (
     PRIMARY KEY (user_id, ticker),
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 );
+
+CREATE TABLE IF NOT EXISTS login_attempts (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    username     TEXT    NOT NULL,
+    ip           TEXT    NOT NULL,
+    success      INTEGER NOT NULL DEFAULT 0,
+    attempted_at TEXT    NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_login_attempts_lookup
+    ON login_attempts(username, ip, attempted_at);
 """
 
 
@@ -82,10 +104,27 @@ def init_db(db_path: Path | None = None) -> Path:
     """Create data/ dir and apply schema. Idempotent. Returns DB path."""
     path = db_path or DB_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(path) as conn:
-        conn.executescript(_SCHEMA)
-        conn.commit()
+    # Serialize schema+migration work — two threads racing the very first
+    # run would both ALTER TABLE and crash on "duplicate column name".
+    with _db_lock:
+        with sqlite3.connect(path, timeout=10.0) as conn:
+            conn.executescript(_SCHEMA)
+            _migrate(conn)
+            conn.commit()
     return path
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Apply incremental migrations to pre-existing databases.
+
+    New installs get the full schema from `_SCHEMA`; old installs only
+    receive the columns/tables added after their creation.
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(users)")}
+    if "token_version" not in cols:
+        conn.execute(
+            "ALTER TABLE users ADD COLUMN token_version INTEGER NOT NULL DEFAULT 0"
+        )
 
 
 @contextmanager
@@ -97,9 +136,10 @@ def connect(db_path: Path | None = None) -> Iterator[sqlite3.Connection]:
             conn.execute(...)
     """
     path = db_path or DB_PATH
-    # Ensure schema exists (cheap; uses CREATE TABLE IF NOT EXISTS)
-    if not path.exists():
-        init_db(path)
+    # Ensure schema + migrations exist. Idempotent and cheap:
+    # executescript uses CREATE TABLE IF NOT EXISTS and _migrate() is a
+    # single PRAGMA check + optional ALTER.
+    init_db(path)
     with _db_lock:
         conn = sqlite3.connect(path, timeout=10.0)
         conn.row_factory = sqlite3.Row
