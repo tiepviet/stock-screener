@@ -184,6 +184,37 @@ def test_alert_delivery_is_admin_only_and_message_is_fixed(
     assert sent == ["Test alert from TSE Stock Screener"]
 
 
+def test_alert_scan_rechecks_capability_after_provider_work(
+    secure_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    token = _token(secure_client, "alice")
+    user = auth.get_by_username("alice")
+    assert user is not None
+    auth.set_alert_capability(user.id, True)
+    delivered: list[str] = []
+
+    class FakeScanner:
+        def __init__(self, tickers: list[str], lookback_days: int) -> None:
+            pass
+
+        def scan(self) -> dict[str, list[object]]:
+            auth.set_alert_capability(user.id, False)
+            return {}
+
+        def deliver_results(self, results, stop_event=None, can_deliver=None) -> bool:
+            delivered.append("sent")
+            return True
+
+    monkeypatch.setattr("backend.services.AlertScanner", FakeScanner)
+    response = secure_client.post(
+        "/api/v1/alerts/scans",
+        headers=_headers(token),
+        json={"tickers": ["7203"], "send_alerts": True},
+    )
+    assert response.status_code == 403
+    assert delivered == []
+
+
 def test_corrupt_portfolio_is_quarantined(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(portfolio, "PORTFOLIO_FILE", tmp_path / "portfolio.json")
     legacy = portfolio._portfolio_path(7)
