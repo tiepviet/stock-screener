@@ -5,6 +5,7 @@ Single-tenant by design (the user requested one pre-created account).
 Create the first user via CLI:
 
     python -m src.stock_screener.auth create-user <username> <password>
+    python -m src.stock_screener.auth grant-alerts <username>
 
 Or from inside Python:
 
@@ -22,15 +23,15 @@ import re
 import secrets
 import sys
 from dataclasses import dataclass
-from datetime import UTC
+from datetime import timezone
 from pathlib import Path
 
 import bcrypt
 
 from . import db
 
-# Load .env from project root so `python -m src.stock_screener.auth ...`
-# and `streamlit run app.py` both see the same env vars. override=False
+# Load .env from project root so CLI tools and the FastAPI process see the
+# same environment variables. override=False
 # so real process env always wins.
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
@@ -50,11 +51,19 @@ _load_dotenv_once()
 logger = logging.getLogger(__name__)
 
 _MIN_PW_LEN = 8
+_PLACEHOLDER_PASSWORDS = {
+    "change-me-now-please",
+    "change-this-password",
+    "password",
+    "admin",
+    "secret",
+}
 
 # Brute-force protection: after MAX_FAILED_ATTEMPTS failed logins for the
-# same (username, ip) pair inside LOCKOUT_WINDOW, further attempts are
-# rejected until the window slides past.
+# same (username, ip) pair, or MAX_ACCOUNT_FAILED_ATTEMPTS for the account,
+# further attempts are rejected until the window slides past.
 MAX_FAILED_ATTEMPTS = 5
+MAX_ACCOUNT_FAILED_ATTEMPTS = 20
 LOCKOUT_WINDOW_MINUTES = 15
 
 
@@ -62,6 +71,7 @@ LOCKOUT_WINDOW_MINUTES = 15
 class UserRecord:
     id: int
     username: str
+    can_send_alerts: bool = False
 
 
 def hash_password(plain: str) -> str:
@@ -109,24 +119,42 @@ def verify_password(plain: str, hashed: str) -> bool:
         return False
 
 
-def create_user(username: str, password: str) -> UserRecord:
+def _is_placeholder_password(password: str) -> bool:
+    return (password or "").strip().lower() in _PLACEHOLDER_PASSWORDS
+
+
+def create_user(
+    username: str,
+    password: str,
+    can_send_alerts: bool | None = None,
+) -> UserRecord:
     """Create a new user. Raises ValueError on duplicate username or weak pw."""
     username = (username or "").strip()
+    if any(ord(char) < 32 or ord(char) == 127 for char in username):
+        raise ValueError("Username contains control characters")
     if not username:
         raise ValueError("Username must be non-empty")
     if len(password or "") < _MIN_PW_LEN:
         raise ValueError(f"Password must be at least {_MIN_PW_LEN} characters")
+    if _is_placeholder_password(password):
+        raise ValueError("Password is a known placeholder; choose a unique password")
+
+    if can_send_alerts is None:
+        configured_admin = os.getenv("TSE_ADMIN_USER", "").strip()
+        can_send_alerts = bool(configured_admin) and username == configured_admin
+    else:
+        can_send_alerts = bool(can_send_alerts)
 
     pw_hash = hash_password(password)
     from datetime import datetime
 
-    now = datetime.now(UTC).isoformat()
+    now = datetime.now(timezone.utc).isoformat()  # noqa: UP017
     try:
         with db.connect() as conn:
             cur = conn.execute(
-                "INSERT INTO users (username, password_hash, created_at) "
-                "VALUES (?, ?, ?)",
-                (username, pw_hash, now),
+                "INSERT INTO users (username, password_hash, created_at, can_send_alerts) "
+                "VALUES (?, ?, ?, ?)",
+                (username, pw_hash, now, 1 if can_send_alerts else 0),
             )
             uid = int(cur.lastrowid)
     except Exception as e:
@@ -134,26 +162,30 @@ def create_user(username: str, password: str) -> UserRecord:
             raise ValueError(f"Username '{username}' already exists") from e
         raise
     logger.debug("Created user '%s' (id=%d)", username, uid)
-    return UserRecord(id=uid, username=username)
+    return UserRecord(id=uid, username=username, can_send_alerts=can_send_alerts)
 
 
 def get_by_username(username: str) -> UserRecord | None:
     """Fetch a user record by username. Returns None if not found."""
     with db.connect() as conn:
         row = conn.execute(
-            "SELECT id, username FROM users WHERE username = ?",
+            "SELECT id, username, can_send_alerts FROM users WHERE username = ?",
             (username,),
         ).fetchone()
     if row is None:
         return None
-    return UserRecord(id=int(row["id"]), username=str(row["username"]))
+    return UserRecord(
+        id=int(row["id"]),
+        username=str(row["username"]),
+        can_send_alerts=bool(row["can_send_alerts"]),
+    )
 
 
 def verify_user(username: str, password: str) -> UserRecord | None:
     """Verify credentials. Returns the UserRecord on success, None on failure."""
     with db.connect() as conn:
         row = conn.execute(
-            "SELECT id, username, password_hash FROM users WHERE username = ?",
+            "SELECT id, username, password_hash, can_send_alerts FROM users WHERE username = ?",
             (username,),
         ).fetchone()
     if row is None:
@@ -162,7 +194,11 @@ def verify_user(username: str, password: str) -> UserRecord | None:
         return None
     if not verify_password(password, str(row["password_hash"])):
         return None
-    return UserRecord(id=int(row["id"]), username=str(row["username"]))
+    return UserRecord(
+        id=int(row["id"]),
+        username=str(row["username"]),
+        can_send_alerts=bool(row["can_send_alerts"]),
+    )
 
 
 def _prune_login_attempts(conn, cutoff_iso: str) -> None:
@@ -182,6 +218,15 @@ def _failed_count(conn, username: str, ip: str, since_iso: str) -> int:
     return int(row["n"])
 
 
+def _account_failed_count(conn, username: str, since_iso: str) -> int:
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM login_attempts "
+        "WHERE username = ? AND success = 0 AND attempted_at >= ?",
+        (username, since_iso),
+    ).fetchone()
+    return int(row["n"])
+
+
 def attempt_login(
     username: str, password: str, ip: str = "unknown"
 ) -> tuple[UserRecord | None, str | None]:
@@ -189,25 +234,47 @@ def attempt_login(
 
     ``error`` is None on success, "invalid" for wrong credentials, or
     "locked" when too many failures accumulated for this (username, ip)
-    pair. Every attempt is recorded so the lockout window slides.
+    pair or account-wide threshold. Every attempt is recorded so the lockout
+    window slides.
     """
     username = (username or "").strip()
+    ip = str(ip or "unknown")[:128]
+    if any(ord(char) < 32 or ord(char) == 127 for char in username + ip):
+        return None, "invalid"
     if not username or not password:
         return None, "invalid"
 
     from datetime import datetime, timedelta
 
-    now = datetime.now(UTC)
+    now = datetime.now(timezone.utc)  # noqa: UP017
     window_start = (now - timedelta(minutes=LOCKOUT_WINDOW_MINUTES)).isoformat()
 
+    # Keep the database lock short. Bcrypt is intentionally CPU-expensive;
+    # holding the process-wide SQLite lock across it serializes unrelated API
+    # requests and turns concurrent login attempts into a denial-of-service.
     with db.connect() as conn:
-        if _failed_count(conn, username, ip, window_start) >= MAX_FAILED_ATTEMPTS:
+        if (
+            _failed_count(conn, username, ip, window_start) >= MAX_FAILED_ATTEMPTS
+            or _account_failed_count(conn, username, window_start)
+            >= MAX_ACCOUNT_FAILED_ATTEMPTS
+        ):
             logger.warning(
-                "Login rate-limited for user '%s' ip=%s (>=%d failures in %dm)",
-                username, ip, MAX_FAILED_ATTEMPTS, LOCKOUT_WINDOW_MINUTES,
+                "Login rate-limited for user '%s' ip=%s (too many failures in %dm)",
+                username, ip, LOCKOUT_WINDOW_MINUTES,
             )
             return None, "locked"
-        rec = verify_user(username, password)
+
+    rec = verify_user(username, password)
+
+    # Recheck after bcrypt so concurrent failures cannot all bypass the
+    # threshold. The insert and prune remain one short transaction.
+    with db.connect() as conn:
+        if (
+            _failed_count(conn, username, ip, window_start) >= MAX_FAILED_ATTEMPTS
+            or _account_failed_count(conn, username, window_start)
+            >= MAX_ACCOUNT_FAILED_ATTEMPTS
+        ):
+            return None, "locked"
         conn.execute(
             "INSERT INTO login_attempts (username, ip, success, attempted_at) "
             "VALUES (?, ?, ?, ?)",
@@ -215,6 +282,18 @@ def attempt_login(
         )
         _prune_login_attempts(conn, window_start)
     return (rec, None) if rec is not None else (None, "invalid")
+
+
+def set_alert_capability(user_id: int, enabled: bool) -> None:
+    """Grant or revoke external alert delivery for an existing account."""
+
+    with db.connect() as conn:
+        cur = conn.execute(
+            "UPDATE users SET can_send_alerts = ? WHERE id = ?",
+            (1 if enabled else 0, int(user_id)),
+        )
+        if cur.rowcount == 0:
+            raise KeyError(f"User id={user_id} not found")
 
 
 def get_token_version(user_id: int) -> int:
@@ -248,6 +327,8 @@ def increment_token_version(user_id: int) -> int:
 
 def change_password(user_id: int, new_password: str) -> None:
     """Update a user's password hash and revoke all outstanding sessions."""
+    if _is_placeholder_password(new_password):
+        raise ValueError("Password is a known placeholder; choose a unique password")
     new_hash = hash_password(new_password)
     with db.connect() as conn:
         conn.execute(
@@ -298,14 +379,54 @@ def bootstrap_admin_from_env(env: dict[str, str] | None = None) -> UserRecord | 
             _MIN_PW_LEN,
         )
         return None
+    environment = os.getenv("TSE_ENVIRONMENT", "development").strip().lower()
+    if password.strip().lower() in _PLACEHOLDER_PASSWORDS or (
+        environment in {"production", "prod"} and len(password) < 12
+    ):
+        logger.warning("Bootstrap skipped: TSE_ADMIN_PASSWORD is a placeholder or too short")
+        return None
 
     try:
-        rec = create_user(username, password)
+        rec = create_user(username, password, can_send_alerts=True)
         logger.info("Bootstrapped admin user '%s' from environment", username)
         return rec
     except ValueError as e:
         logger.warning("Bootstrap failed: %s", e)
         return None
+
+
+def revoke_known_bootstrap_credentials() -> int:
+    """Invalidate only fixed placeholder credentials shipped in old examples.
+
+    The currently configured environment credential is an active operator
+    secret, not a known compromised placeholder.  It must remain usable after
+    startup; rotating it requires an explicit password-management action.
+    """
+
+    candidates = {("admin", password) for password in _PLACEHOLDER_PASSWORDS}
+    configured_user = os.getenv("TSE_ADMIN_USER", "").strip()
+    if configured_user:
+        candidates.update((configured_user, password) for password in _PLACEHOLDER_PASSWORDS)
+    revoked = 0
+    for username, password in candidates:
+        if get_by_username(username) is None:
+            continue
+        record = verify_user(username, password)
+        if record is None:
+            continue
+        replacement = secrets.token_urlsafe(32)
+        with db.connect() as conn:
+            conn.execute(
+                "UPDATE users SET password_hash = ?, token_version = token_version + 1 "
+                "WHERE id = ?",
+                (hash_password(replacement), record.id),
+            )
+        logger.critical(
+            "Revoked a known bootstrap credential for user id=%d; set a new password",
+            record.id,
+        )
+        revoked += 1
+    return revoked
 
 
 # ---------------------------------------------------------------------------
@@ -324,6 +445,15 @@ def _cli(argv: list[str]) -> int:
     p_passwd.add_argument("username")
     p_passwd.add_argument("password")
 
+    p_grant = sub.add_parser(
+        "grant-alerts", help="Allow a user to send external alerts"
+    )
+    p_grant.add_argument("username")
+    p_revoke = sub.add_parser(
+        "revoke-alerts", help="Prevent a user from sending external alerts"
+    )
+    p_revoke.add_argument("username")
+
     args = parser.parse_args(argv)
     db.init_db()
 
@@ -334,6 +464,16 @@ def _cli(argv: list[str]) -> int:
             print(f"Error: {e}", file=sys.stderr)
             return 1
         print(f"Created user '{user.username}' (id={user.id})")
+        return 0
+
+    if args.cmd in {"grant-alerts", "revoke-alerts"}:
+        user = get_by_username(args.username)
+        if user is None:
+            print(f"Error: user '{args.username}' not found", file=sys.stderr)
+            return 1
+        set_alert_capability(user.id, args.cmd == "grant-alerts")
+        state = "enabled" if args.cmd == "grant-alerts" else "disabled"
+        print(f"Alert delivery {state} for '{user.username}'")
         return 0
 
     if args.cmd == "change-password":

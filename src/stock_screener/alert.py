@@ -16,7 +16,10 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import threading
+from collections.abc import Callable
 from datetime import timedelta
+from urllib.parse import urlsplit
 
 import requests
 
@@ -34,6 +37,12 @@ from .technical_engine import (
 from .watchlist import DEFAULT_TICKERS
 
 logger = logging.getLogger(__name__)
+
+try:
+    _ALERT_CONCURRENCY = max(1, min(int(os.getenv("TSE_ALERT_MAX_CONCURRENCY", "2")), 16))
+except (TypeError, ValueError):
+    _ALERT_CONCURRENCY = 2
+_ALERT_SEMAPHORE = threading.BoundedSemaphore(_ALERT_CONCURRENCY)
 
 
 # ---------------------------------------------------------------------------
@@ -62,7 +71,7 @@ class TelegramSender:
             True if sent successfully, False otherwise.
         """
         if not self.bot_token or not self.chat_id:
-            logger.info("Telegram not configured. Message:\n%s", text)
+            logger.info("Telegram not configured; message was not delivered")
             return False
 
         url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
@@ -74,13 +83,29 @@ class TelegramSender:
         }
 
         try:
-            resp = requests.post(url, json=payload, timeout=10)
+            if not _ALERT_SEMAPHORE.acquire(timeout=10):
+                return False
+            try:
+                resp = requests.post(url, json=payload, timeout=10, allow_redirects=False)
+            finally:
+                _ALERT_SEMAPHORE.release()
             resp.raise_for_status()
             logger.info("Telegram message sent")
             return True
-        except Exception:
-            logger.exception("Failed to send Telegram message")
+        except requests.RequestException as exc:
+            logger.warning(
+                "Telegram delivery failed (%s)",
+                type(exc).__name__,
+            )
             return False
+        except Exception as exc:
+            logger.warning("Telegram delivery failed (%s)", type(exc).__name__)
+            return False
+
+    def _send_safely(self, text: str) -> bool:
+        """Compatibility hook for callers that prefer a single send method."""
+
+        return self.send(text)
 
 
 # ---------------------------------------------------------------------------
@@ -91,9 +116,33 @@ class SlackSender:
     """Send messages via Slack Webhook (Incoming Webhook)."""
 
     def __init__(self, webhook_url: str | None = None) -> None:
-        self.webhook_url = webhook_url or os.getenv("SLACK_WEBHOOK_URL", "")
+        configured = webhook_url or os.getenv("SLACK_WEBHOOK_URL", "")
+        self.webhook_url = self._validate_webhook_url(configured)
         if not self.webhook_url:
-            logger.warning("SLACK_WEBHOOK_URL not set — messages will only be logged")
+            logger.warning("SLACK_WEBHOOK_URL is missing or invalid — delivery is disabled")
+
+    @staticmethod
+    def _validate_webhook_url(value: str) -> str:
+        if not value:
+            return ""
+        try:
+            parsed = urlsplit(value)
+        except ValueError:
+            return ""
+        hostname = (parsed.hostname or "").lower()
+        if (
+            parsed.scheme != "https"
+            or parsed.username
+            or parsed.password
+            or not (
+                hostname == "hooks.slack.com"
+                or hostname.endswith(".slack.com")
+                or hostname == "hooks.slack-gov.com"
+                or hostname.endswith(".slack-gov.com")
+            )
+        ):
+            return ""
+        return value
 
     @staticmethod
     def _html_to_mrkdwn(text: str) -> str:
@@ -119,17 +168,33 @@ class SlackSender:
             True if sent successfully, False otherwise.
         """
         if not self.webhook_url:
-            logger.info("Slack not configured. Message:\n%s", text)
+            logger.info("Slack not configured; message was not delivered")
             return False
 
         try:
             payload = {"text": self._html_to_mrkdwn(text)}
-            resp = requests.post(self.webhook_url, json=payload, timeout=10)
+            if not _ALERT_SEMAPHORE.acquire(timeout=10):
+                return False
+            try:
+                resp = requests.post(
+                    self.webhook_url,
+                    json=payload,
+                    timeout=10,
+                    allow_redirects=False,
+                )
+            finally:
+                _ALERT_SEMAPHORE.release()
             resp.raise_for_status()
             logger.info("Slack message sent")
             return True
-        except Exception:
-            logger.exception("Failed to send Slack message")
+        except requests.RequestException as exc:
+            logger.warning(
+                "Slack delivery failed (%s)",
+                type(exc).__name__,
+            )
+            return False
+        except Exception as exc:
+            logger.warning("Slack delivery failed (%s)", type(exc).__name__)
             return False
 
 
@@ -245,6 +310,8 @@ class AlertScanner:
         ]
         self.telegram_sender = telegram_sender or TelegramSender()
         self.slack_sender = slack_sender or SlackSender()
+        self.last_delivery: dict[str, bool] = {"telegram": False, "slack": False}
+        self.scan_errors: dict[str, str] = {}
         self.loader = YFinanceDataLoader()
         self.engine = TechnicalEngine()
 
@@ -258,6 +325,7 @@ class AlertScanner:
                 signals.extend(strat.generate_signals(df, ticker))
             return ticker, signals
         except Exception:
+            self.scan_errors[ticker] = "data unavailable"
             logger.exception("Scan failed for %s", ticker)
             return ticker, []
 
@@ -268,6 +336,8 @@ class AlertScanner:
             Dict mapping ticker -> list of signals.
         """
         from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        self.scan_errors = {}
 
         # JST market dates — UTC server would pick the wrong trading day
         from .data_loader import jst_now
@@ -285,32 +355,51 @@ class AlertScanner:
 
         return results
 
-    def scan_and_alert(self) -> dict[str, list[Signal]]:
-        """Scan all tickers, format results, and send via Telegram & Slack.
+    def deliver_results(
+        self,
+        results: dict[str, list[Signal]],
+        stop_event: threading.Event | None = None,
+        can_deliver: Callable[[], bool] | None = None,
+    ) -> bool:
+        """Deliver an already-computed scan, with an optional stop gate."""
 
-        Returns:
-            Dict mapping ticker -> list of signals.
-        """
-        results = self.scan()
         from .data_loader import jst_now
 
-        scan_date = jst_now().strftime("%Y-%m-%d %H:%M")
+        if self.tickers and len(self.scan_errors) == len(self.tickers):
+            logger.warning("Skipping alert delivery because every ticker failed")
+            return False
+        if stop_event is not None and stop_event.is_set():
+            logger.info("Scheduled alert delivery cancelled before dispatch")
+            return False
+        if can_deliver is not None and not can_deliver():
+            logger.info("Alert delivery cancelled because capability was revoked")
+            return False
 
-        # Send combined report (summary includes all signals)
+        scan_date = jst_now().strftime("%Y-%m-%d %H:%M")
         summary = format_summary_report(results, scan_date)
-        sent = sum(
-            1
-            for sender in (self.telegram_sender, self.slack_sender)
-            if sender.send(summary)
-        )
-        if sent == 0:
+        self.last_delivery = {"telegram": False, "slack": False}
+        if (stop_event is None or not stop_event.is_set()) and (
+            can_deliver is None or can_deliver()
+        ):
+            self.last_delivery["telegram"] = bool(self.telegram_sender.send(summary))
+        if (stop_event is None or not stop_event.is_set()) and (
+            can_deliver is None or can_deliver()
+        ):
+            self.last_delivery["slack"] = bool(self.slack_sender.send(summary))
+        if not any(self.last_delivery.values()):
             logger.warning(
                 "No alert channels delivered the report (%d signals, %d tickers) — "
                 "check TELEGRAM/SLACK env config",
                 sum(len(v) for v in results.values()),
-                len(results),
+                len(self.tickers),
             )
+        return any(self.last_delivery.values())
 
+    def scan_and_alert(self) -> dict[str, list[Signal]]:
+        """Scan all tickers, format results, and send via Telegram & Slack."""
+
+        results = self.scan()
+        self.deliver_results(results)
         return results
 
 

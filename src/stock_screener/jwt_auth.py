@@ -13,7 +13,7 @@ Secret management:
 
 Security notes:
   - HTTPS required in production (localStorage is readable by any JS on
-    the same origin). The Streamlit deployment must terminate TLS.
+    the same origin). The FastAPI deployment must terminate TLS.
   - 30-day window is a UX trade-off; tighten by setting `days_valid`
     in `create_token`.
 """
@@ -23,7 +23,7 @@ from __future__ import annotations
 import logging
 import os
 import secrets
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import jwt
@@ -36,16 +36,38 @@ _ALGO = "HS256"
 _SECRET_PATH = db.DATA_DIR / "jwt_secret.key"
 _ISSUER = "tse-stock-screener"
 _TOKEN_DAYS = 30
+_MIN_SECRET_LENGTH = 32
+_SECRET_PLACEHOLDERS = {
+    "use-a-long-random-secret",
+    "change-this-secret",
+    "replace-me",
+    "your-secret-here",
+    "secret",
+}
+
+
+def _validate_secret(secret: str, source: str) -> str:
+    value = (secret or "").strip()
+    if len(value) < _MIN_SECRET_LENGTH:
+        raise ValueError(f"{source} must contain at least {_MIN_SECRET_LENGTH} characters")
+    if value.lower() in _SECRET_PLACEHOLDERS or len(set(value)) < 8:
+        raise ValueError(f"{source} is a known or weak placeholder")
+    return value
 
 
 def _load_or_create_secret(path: Path | None = None) -> str:
     """Return the JWT signing secret, creating it on first use."""
     env_secret = os.environ.get("TSE_JWT_SECRET")
     if env_secret:
-        return env_secret
+        return _validate_secret(env_secret, "TSE_JWT_SECRET")
     p = path or _SECRET_PATH
     if p.exists():
-        return p.read_text().strip()
+        secret = _validate_secret(p.read_text().strip(), str(p))
+        try:
+            p.chmod(0o600)
+        except OSError:
+            pass
+        return secret
     p.parent.mkdir(parents=True, exist_ok=True)
     secret = secrets.token_urlsafe(32)
     p.write_text(secret)
@@ -69,7 +91,7 @@ def create_token(
     `token_version` is embedded as "tv"; call sites cross-check it against
     the DB so tokens become invalid after logout / password change.
     """
-    now = datetime.now(UTC)
+    now = datetime.now(timezone.utc)  # noqa: UP017
     payload = {
         "sub": str(user_id),
         "username": username,
@@ -78,7 +100,7 @@ def create_token(
         "exp": int((now + timedelta(days=days_valid)).timestamp()),
         "tv": int(token_version),
     }
-    key = secret or _load_or_create_secret()
+    key = _validate_secret(secret, "secret") if secret else _load_or_create_secret()
     return jwt.encode(payload, key, algorithm=_ALGO)
 
 
@@ -90,7 +112,7 @@ def verify_token(token: str, secret: str | None = None) -> dict | None:
     """
     if not token or not isinstance(token, str):
         return None
-    key = secret or _load_or_create_secret()
+    key = _validate_secret(secret, "secret") if secret else _load_or_create_secret()
     try:
         payload = jwt.decode(
             token,

@@ -122,6 +122,7 @@ class FundamentalScreener:
 
         # Batch fetch all fundamentals (uses cache)
         all_fundies = self.loader.fetch_batch_fundamentals(tickers)
+        self.last_errors = dict(getattr(self.loader, "last_batch_errors", {}))
 
         rows: list[dict] = []
 

@@ -14,7 +14,13 @@ from datetime import datetime
 
 import pandas as pd
 
-from .data_loader import BaseDataLoader, YFinanceDataLoader, jst_now
+from .data_loader import (
+    BaseDataLoader,
+    ProviderBusyError,
+    YFinanceDataLoader,
+    jst_now,
+    provider_io_slot,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +74,8 @@ class EarningsCalendar:
         info = EarningsInfo(ticker=ticker)
 
         try:
-            cal = yf.Ticker(normalized).calendar
+            with provider_io_slot():
+                cal = yf.Ticker(normalized).calendar
             if cal is None or (isinstance(cal, pd.DataFrame) and cal.empty):
                 logger.info("No earnings data for %s", normalized)
                 return info
@@ -112,6 +119,8 @@ class EarningsCalendar:
                     except Exception:
                         continue
 
+        except ProviderBusyError:
+            raise
         except Exception:
             logger.exception("Failed to fetch earnings for %s", normalized)
 

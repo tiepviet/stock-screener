@@ -11,7 +11,13 @@ import json
 import logging
 import os
 import re
+import tempfile
+import threading
+import time
 from abc import ABC, abstractmethod
+from collections import OrderedDict
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -41,14 +47,21 @@ _CACHE_RANGE_RE = re.compile(
 )
 
 # Caches live under DATA_DIR (TSE_DATA_DIR-aware) so they survive redeploys
-# and don't depend on the process CWD (a relative "cache/" would land
-# wherever streamlit happened to be launched).
+# and don't depend on the process working directory.
 CACHE_DIR = db.DATA_DIR / "cache"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
+try:
+    CACHE_DIR.chmod(0o700)
+except OSError:
+    pass
 
 # Fundamentals cache: JSON files per ticker, 24h expiry
 FUND_CACHE_DIR = CACHE_DIR / "fundamentals"
 FUND_CACHE_DIR.mkdir(exist_ok=True)
+try:
+    FUND_CACHE_DIR.chmod(0o700)
+except OSError:
+    pass
 
 # Cache schema version. v1 stored dividend_yield as a percentage (e.g. 3.72)
 # and had no version marker; v2 stores the raw fraction (e.g. 0.0372) and is
@@ -56,8 +69,127 @@ FUND_CACHE_DIR.mkdir(exist_ok=True)
 FUND_CACHE_VERSION = 2
 
 # In-memory cache for fundamentals to avoid repeated disk reads
-_fund_cache_mem: dict[str, tuple[datetime, dict]] = {}
+_fund_cache_mem: OrderedDict[str, tuple[datetime, dict]] = OrderedDict()
 _FUND_MEM_TTL = timedelta(hours=1)
+try:
+    _FUND_MEM_MAX_ENTRIES = max(
+        16, min(int(os.getenv("TSE_FUND_CACHE_MAX_ENTRIES", "512")), 10_000)
+    )
+except (TypeError, ValueError):
+    _FUND_MEM_MAX_ENTRIES = 512
+_CACHE_MAINTENANCE_LOCK = threading.RLock()
+_FUND_CACHE_LOCK = threading.RLock()
+
+
+class ProviderBusyError(RuntimeError):
+    """Raised when the bounded provider I/O pool is saturated."""
+
+
+def _provider_capacity() -> int:
+    try:
+        value = int(os.getenv("TSE_PROVIDER_MAX_CONCURRENCY", "8"))
+    except (TypeError, ValueError):
+        value = 8
+    return max(1, min(value, 64))
+
+
+_PROVIDER_SEMAPHORE = threading.BoundedSemaphore(_provider_capacity())
+_PROVIDER_RATE_LOCK = threading.Lock()
+_PROVIDER_NEXT_CALL = 0.0
+try:
+    _PROVIDER_MIN_INTERVAL = max(
+        0.0,
+        min(float(os.getenv("TSE_PROVIDER_MIN_INTERVAL_MS", "0")) / 1000.0, 10.0),
+    )
+except (TypeError, ValueError):
+    _PROVIDER_MIN_INTERVAL = 0.0
+
+
+@contextmanager
+def provider_io_slot() -> Iterator[None]:
+    """Limit actual network calls, including calls inside parallel batches."""
+
+    global _PROVIDER_NEXT_CALL
+    if not _PROVIDER_SEMAPHORE.acquire(timeout=30):
+        raise ProviderBusyError("market data provider capacity is busy")
+    try:
+        if _PROVIDER_MIN_INTERVAL:
+            with _PROVIDER_RATE_LOCK:
+                wait_for = max(0.0, _PROVIDER_NEXT_CALL - time.monotonic())
+                _PROVIDER_NEXT_CALL = time.monotonic() + _PROVIDER_MIN_INTERVAL
+            if wait_for > 0:
+                time.sleep(wait_for)
+        yield
+    finally:
+        _PROVIDER_SEMAPHORE.release()
+
+
+def enforce_cache_quota() -> int:
+    """Bound persistent provider-cache growth; return files removed."""
+
+    try:
+        max_files = max(100, min(int(os.getenv("TSE_CACHE_MAX_FILES", "2000")), 1_000_000))
+    except (TypeError, ValueError):
+        max_files = 2000
+    try:
+        max_bytes = max(
+            10 * 1024 * 1024,
+            min(
+                int(os.getenv("TSE_CACHE_MAX_BYTES", str(512 * 1024 * 1024))),
+                100 * 1024 * 1024 * 1024,
+            ),
+        )
+    except (TypeError, ValueError):
+        max_bytes = 512 * 1024 * 1024
+    with _CACHE_MAINTENANCE_LOCK:
+        files = [
+            path
+            for path in CACHE_DIR.rglob("*")
+            if path.is_file()
+            and not path.is_symlink()
+            and path.suffix in {".parquet", ".json"}
+        ]
+        files.sort(key=lambda path: path.stat().st_mtime)
+        total_bytes = sum(path.stat().st_size for path in files)
+        removed = 0
+        while files and (len(files) > max_files or total_bytes > max_bytes):
+            path = files.pop(0)
+            try:
+                total_bytes -= path.stat().st_size
+                path.unlink()
+                removed += 1
+            except OSError:
+                logger.debug("Could not evict cache file %s", path.name)
+        if removed:
+            logger.info("Evicted %d provider cache files", removed)
+        return removed
+
+
+def _atomic_write_text(path: Path, payload: str) -> None:
+    """Atomically replace a cache text file without following symlinks."""
+
+    temporary_name: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary:
+            temporary_name = temporary.name
+            temporary.write(payload)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_name, path)
+        temporary_name = None
+    finally:
+        if temporary_name:
+            try:
+                os.unlink(temporary_name)
+            except FileNotFoundError:
+                pass
 
 
 class BaseDataLoader(ABC):
@@ -217,9 +349,12 @@ class YFinanceDataLoader(BaseDataLoader):
 
         logger.info("Fetching OHLCV: %s [%s -> %s]", normalized, start, end)
         try:
-            data = yf.download(
-                normalized, start=start, end=end, interval=interval, progress=False
-            )
+            with provider_io_slot():
+                data = yf.download(
+                    normalized, start=start, end=end, interval=interval, progress=False
+                )
+        except ProviderBusyError:
+            raise
         except Exception:
             logger.exception("yfinance download failed for %s", normalized)
             raise
@@ -237,12 +372,32 @@ class YFinanceDataLoader(BaseDataLoader):
         if data.empty:
             raise ValueError(f"No valid close prices for {normalized}")
 
-        # Atomic write: temp file + os.replace. Concurrent writers (UI thread
-        # + background scanner) must never leave a truncated parquet behind.
+        # Atomic write: unique same-directory temp + os.replace. Concurrent
+        # writers must never leave a truncated parquet behind.
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        tmp = cache.with_suffix(".parquet.tmp")
-        data.to_parquet(tmp)
-        os.replace(tmp, cache)
+        temporary_name: str | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                dir=cache.parent,
+                prefix=f".{cache.name}.",
+                suffix=".parquet.tmp",
+                delete=False,
+            ) as temporary:
+                temporary_name = temporary.name
+            data.to_parquet(temporary_name)
+            try:
+                Path(temporary_name).chmod(0o600)
+            except OSError:
+                pass
+            os.replace(temporary_name, cache)
+            temporary_name = None
+        finally:
+            if temporary_name:
+                try:
+                    os.unlink(temporary_name)
+                except FileNotFoundError:
+                    pass
+        enforce_cache_quota()
         logger.info("Cached %d bars for %s", len(data), normalized)
         return data
 
@@ -255,10 +410,13 @@ class YFinanceDataLoader(BaseDataLoader):
     def _read_fund_cache(self, ticker: str) -> dict[str, Any] | None:
         """Read fundamentals from memory, then disk cache."""
         # Memory cache
-        if ticker in _fund_cache_mem:
-            cached_at, data = _fund_cache_mem[ticker]
-            if datetime.now() - cached_at < _FUND_MEM_TTL:
-                return data
+        with _FUND_CACHE_LOCK:
+            if ticker in _fund_cache_mem:
+                cached_at, data = _fund_cache_mem[ticker]
+                if datetime.now() - cached_at < _FUND_MEM_TTL:
+                    _fund_cache_mem.move_to_end(ticker)
+                    return data
+                _fund_cache_mem.pop(ticker, None)
 
         # Disk cache
         path = self._fund_cache_path(ticker)
@@ -268,7 +426,11 @@ class YFinanceDataLoader(BaseDataLoader):
                 cached_at = datetime.fromisoformat(data.get("_cached_at", ""))
                 if datetime.now() - cached_at < timedelta(hours=self._CACHE_EXPIRY_HOURS):
                     result = {k: v for k, v in data.items() if not k.startswith("_")}
-                    _fund_cache_mem[ticker] = (cached_at, result)
+                    with _FUND_CACHE_LOCK:
+                        _fund_cache_mem[ticker] = (cached_at, result)
+                        _fund_cache_mem.move_to_end(ticker)
+                        while len(_fund_cache_mem) > _FUND_MEM_MAX_ENTRIES:
+                            _fund_cache_mem.popitem(last=False)
                     return result
             except Exception:
                 logger.debug("Fund cache read failed for %s", ticker)
@@ -284,12 +446,17 @@ class YFinanceDataLoader(BaseDataLoader):
         data_with_ts = {**data, "_cached_at": datetime.now().isoformat()}
         path = self._fund_cache_path(ticker)
         try:
-            path.write_text(json.dumps(data_with_ts, default=str))
+            _atomic_write_text(path, json.dumps(data_with_ts, default=str))
+            enforce_cache_quota()
             legacy = FUND_CACHE_DIR / f"{ticker.replace('.', '_')}.json"
             legacy.unlink(missing_ok=True)
         except Exception:
             logger.debug("Fund cache write failed for %s", ticker)
-        _fund_cache_mem[ticker] = (datetime.now(), data)
+        with _FUND_CACHE_LOCK:
+            _fund_cache_mem[ticker] = (datetime.now(), data)
+            _fund_cache_mem.move_to_end(ticker)
+            while len(_fund_cache_mem) > _FUND_MEM_MAX_ENTRIES:
+                _fund_cache_mem.popitem(last=False)
 
     def fetch_fundamentals(self, ticker: str) -> dict[str, Any]:
         """Fetch fundamentals via yfinance .info property (with caching).
@@ -312,8 +479,11 @@ class YFinanceDataLoader(BaseDataLoader):
 
         logger.info("Fetching fundamentals: %s", normalized)
         try:
-            ticker_obj = yf.Ticker(normalized)
-            info = ticker_obj.info
+            with provider_io_slot():
+                ticker_obj = yf.Ticker(normalized)
+                info = ticker_obj.info
+        except ProviderBusyError:
+            raise
         except Exception:
             logger.exception("yfinance info failed for %s", normalized)
             info = None
@@ -350,13 +520,20 @@ class YFinanceDataLoader(BaseDataLoader):
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
         results: dict[str, dict[str, Any]] = {}
+        self.last_batch_errors: dict[str, str] = {}
         with ThreadPoolExecutor(max_workers=8) as executor:
             futures = {executor.submit(self.fetch_fundamentals, t): t for t in tickers}
             for future in as_completed(futures):
                 ticker = futures[future]
                 try:
-                    results[ticker] = future.result()
+                    value = future.result()
+                    results[ticker] = value
+                    if value and all(item is None for item in value.values()):
+                        self.last_batch_errors[ticker] = "data unavailable"
+                except ProviderBusyError:
+                    raise
                 except Exception:
                     logger.exception("Batch fetch failed for %s", ticker)
+                    self.last_batch_errors[ticker] = "data unavailable"
                     results[ticker] = {k: None for k in ("pe", "pb", "roe", "eps", "dividend_yield", "market_cap", "sector", "industry")}
         return results

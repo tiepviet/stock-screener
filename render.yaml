@@ -1,38 +1,53 @@
 services:
   - type: web
     name: stock-screener
-    env: python
-    # Standard build command to install dependencies
-    buildCommand: pip install -r requirements.txt
-    # Start command for Streamlit
-    startCommand: streamlit run app.py --server.port $PORT --server.address 0.0.0.0
+    runtime: python
+    plan: starter
+    buildCommand: npm ci --prefix frontend && npm run build --prefix frontend && pip install -r requirements.txt
+    startCommand: uvicorn backend.main:app --host 0.0.0.0 --port $PORT --workers 1 --no-proxy-headers
+    healthCheckPath: /api/v1/health
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.10
+      - key: NODE_VERSION
+        value: 20.19.1
+      - key: TSE_ENVIRONMENT
+        value: production
+      - key: TSE_ENABLE_DOCS
+        value: "false"
+      - key: TSE_ALLOWED_HOSTS
+        value: "*.onrender.com"
+      - key: TSE_FORCE_HTTPS_HEADERS
+        value: "true"
       - key: TSE_ADMIN_USER
         sync: true
       - key: TSE_ADMIN_PASSWORD
-        sync: true
+        sync: false
       - key: TSE_JWT_SECRET
         generateValue: true
-      # Default to a local data dir inside the ephemeral filesystem.
-      # The SQLite DB (users, settings, watchlist), JWT secret and caches
-      # are LOST on every redeploy on the free tier — there is no persistent
-      # disk there.
-      #
-      # On Render Starter (paid) or higher, attach a persistent disk and
-      # point TSE_DATA_DIR at its mount so the DB + secret survive redeploys:
-      #   - key: TSE_DATA_DIR
-      #     value: /data
-      #
-      # Requires the disk block below to be uncommented (mountPath: /data).
-      # NOTE: do NOT uncomment the disk on the free tier — Render rejects
-      # deployments that reference a disk there.
+      # Set this in the Render dashboard when the frontend is on another
+      # origin. Same-origin deployments should leave it empty.
+      - key: TSE_CORS_ORIGINS
+        sync: false
+      # Set only the proxy ranges that terminate public traffic.
+      - key: TSE_TRUSTED_PROXY_CIDRS
+        sync: false
+      - key: TSE_PROVIDER_MIN_INTERVAL_MS
+        value: "25"
+      - key: TSE_MAX_REQUEST_BYTES
+        value: "2097152"
+      - key: TSE_CACHE_MAX_FILES
+        value: "2000"
+      - key: TSE_CACHE_MAX_BYTES
+        value: "536870912"
+      - key: TSE_LEGACY_PORTFOLIO_USER_ID
+        sync: false
       - key: TSE_DATA_DIR
-        value: ./data
+        value: /data
 
-    # Persistent disk (paid tiers only — Starter or higher):
-    # disk:
-    #   name: screener-data
-    #   mountPath: /data
-    #   sizeGB: 1
+    # Starter supports a persistent disk. Keep one worker while SQLite and
+    # JSON state are used; do not scale this service horizontally.
+    disk:
+      name: screener-data
+      mountPath: /data
+      sizeGB: 1

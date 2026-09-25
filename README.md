@@ -1,151 +1,219 @@
 # TSE Stock Screener
 
-Algorithmic trading & analysis tool for Tokyo Stock Exchange (TSE). Built with Python, Streamlit, and yfinance.
+Algorithmic trading and analysis dashboard for the Tokyo Stock Exchange (TSE).
+
+The application is split into two applications:
+
+- **FastAPI backend** — authentication, market data, screening, signals, backtests, portfolio, and alerts.
+- **React frontend** — responsive dashboard built with Vite and React.
+
+The analysis engine remains in `src/stock_screener/`; the UI no longer depends on Streamlit.
 
 ## Features
 
 | Module | Description |
 |---|---|
-| `data_loader.py` | OHLCV & fundamentals ingestion with Parquet caching (JST-aware freshness). Pluggable interface for J-Quants / Rakuten APIs. |
-| `technical_engine.py` | SMA, RSI, ATR, Bollinger Bands, Volume SMA. Four strategies: VolumeBreakout, PullbackMA + 2 sell-side. |
-| `fundamental_screener.py` | Filter stocks by ROE, P/E, P/B, EPS, Dividend Yield with flexible conditions (fail-closed). |
-| `risk_management.py` | Position sizing (1% rule), hard stop-loss (7%), trailing stop, batch position plans. |
-| `backtest.py` | Historical simulation with commission + slippage (defaults 0.1%), win rate, Sharpe, max drawdown, equity curve. |
-| `alert.py` | Telegram & Slack signal alerts. Daemon mode for daily 15:30 JST scans. |
-| `portfolio.py` | Track positions, unrealized P/L, sector exposure. Persists to JSON. |
-| `earnings_calendar.py` | Flag tickers with upcoming earnings (avoid pre-earnings risk). |
-| `multi_timeframe.py` | Confirm signals across daily + weekly timeframes with confidence scoring. |
-| `screen_chain.py` | Multi-pass screener: fundamental → technical → weighted scoring (missing data penalized). |
-| `price_target.py` / `profit_target.py` | Cluster-based price targets and per-position profit calculators. |
-| `auth.py` / `jwt_auth.py` / `db.py` / `user_store.py` | bcrypt + JWT auth (30-day tokens, rate-limited login, server-side revocation), SQLite persistence. |
-| `watchlist.py` | Single source of truth for default / user / AI ticker lists. |
-| `app.py` | Streamlit dashboard with 12 tabs (Chart, Screener, Signals, Backtest, Portfolio, Earnings, Smart Screen, MTF, Profit Target, Price Target, Alerts, Guide). |
+| `data_loader.py` | OHLCV and fundamentals ingestion with JST-aware Parquet/JSON caching. |
+| `technical_engine.py` | SMA, RSI, ATR, Bollinger Bands, volume SMA, and four strategies. |
+| `fundamental_screener.py` | Fail-closed ROE, P/E, P/B, EPS, and dividend filters. |
+| `risk_management.py` | 1% risk rule, hard stop-loss, position sizing, and batch plans. |
+| `backtest.py` | Historical simulation with commission, slippage, Sharpe, and drawdown metrics. |
+| `alert.py` | Telegram and Slack signal delivery. |
+| `portfolio.py` | Positions, unrealized P/L, sector exposure, trailing stops, and targets. |
+| `earnings_calendar.py` | Upcoming earnings risk checks. |
+| `multi_timeframe.py` | Daily + weekly signal confirmation. |
+| `screen_chain.py` | Fundamental → technical → weighted ranking pipeline. |
+| `price_target.py` / `profit_target.py` | Fibonacci zones, support/resistance, and profit calculators. |
+| `auth.py` / `jwt_auth.py` / `db.py` / `user_store.py` | bcrypt credentials, JWT sessions, rate-limited login, and SQLite persistence. |
 
-## Quick Start
+## Project structure
 
-```bash
-# Clone
-git clone <repo-url>
-cd stock-screener
-
-# Virtual environment
-python -m venv venv
-source venv/bin/activate  # macOS/Linux
-# venv\Scripts\activate   # Windows
-
-# Install
-pip install -r requirements.txt
-
-# Run dashboard
-streamlit run app.py
-```
-
-## Telegram Alerts
-
-```bash
-# 1. Create bot via @BotFather, get token
-# 2. Get chat ID via @userinfobot
-
-export TELEGRAM_BOT_TOKEN="123456:ABC-..."
-export TELEGRAM_CHAT_ID="987654321"
-
-# Run once
-python -m src.stock_screener.alert --tickers 7203 6758 9984
-
-# Run daily at 15:30 JST
-python -m src.stock_screener.alert --daemon
-```
-
-Or copy `.env.example` to `.env` and fill in values.
-
-## Project Structure
-
-```
+```text
 stock-screener/
-├── src/
-│   └── stock_screener/
-│       ├── alert.py               # Telegram/Slack alerts + daemon
-│       ├── auth.py                # bcrypt users, login rate limiting
-│       ├── backtest.py            # backtesting with realistic costs
-│       ├── data_loader.py         # yfinance + caching (JST-aware)
-│       ├── db.py                  # SQLite schema + migrations
-│       ├── earnings_calendar.py
-│       ├── fundamental_screener.py
-│       ├── jwt_auth.py            # JWT tokens with revocation
-│       ├── multi_timeframe.py
-│       ├── portfolio.py
-│       ├── price_target.py        # cluster price-target analysis
-│       ├── profit_target.py       # per-position target calculator
-│       ├── risk_management.py
-│       ├── screen_chain.py
-│       ├── technical_engine.py
-│       ├── user_store.py          # per-user settings/watchlist
-│       ├── watchlist.py           # default ticker lists
-│       └── assets/                # CSS
-├── tests/                         # 160+ pytest tests
-├── app.py                         # Streamlit dashboard (12 tabs)
+├── backend/                    # FastAPI application
+│   ├── main.py                 # routes, lifespan, error handlers
+│   ├── models.py               # Pydantic request/response contracts
+│   ├── dependencies.py         # bearer auth and client identity
+│   ├── security.py             # proxy trust, throttling, security headers
+│   ├── services.py             # reusable analysis orchestration
+│   └── serializers.py          # strict JSON-safe response conversion
+├── frontend/                   # Vite + React application
+│   ├── src/
+│   │   ├── api.js              # typed API client and auth handling
+│   │   ├── main.jsx            # dashboard views and components
+│   │   └── styles.css          # dark responsive design system
+│   └── package.json
+├── src/stock_screener/         # reusable Python analysis engine
+├── legacy/                     # unsupported Streamlit rollback reference only
+├── tests/                      # Python unit and API tests
 ├── requirements.txt
 ├── pyproject.toml
-├── render.yaml                    # Render deployment (Python 3.12)
-├── .env.example
-├── .gitignore
+├── render.yaml
 └── README.md
 ```
 
-## Architecture
+## Quick start
 
-```
-┌─────────────┐     ┌──────────────────┐     ┌─────────────────┐
-│  Data Loader │────▶│ Technical Engine  │────▶│    Strategies    │
-│  (yfinance)  │     │  (pandas_ta)     │     │  Breakout / MA   │
-└─────────────┘     └──────────────────┘     └────────┬────────┘
-       │                                               │
-       ▼                                               ▼
-┌─────────────┐     ┌──────────────────┐     ┌─────────────────┐
-│  Screener    │     │  Risk Management │     │     Backtest     │
-│ (fundamental)│     │ (position size)  │     │   (simulate)     │
-└─────────────┘     └──────────────────┘     └─────────────────┘
-       │                       │                       │
-       └───────────────────────┼───────────────────────┘
-                               ▼
-                    ┌──────────────────┐
-                    │   Streamlit App   │
-                    │  (dashboard)      │
-                    └──────────────────┘
+### 1. Backend
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate          # macOS/Linux
+# .venv\\Scripts\\activate         # Windows
+pip install -r requirements.txt
+cp .env.example .env
+uvicorn backend.main:app --reload --port 8000 --no-proxy-headers
 ```
 
-## Data Sources
+API documentation:
 
-| Source | Status | Notes |
-|---|---|---|
-| yfinance | Default | Free, auto `.T` suffix for JP tickers |
-| J-Quants API | Planned | JPX official, paid (free tier available) |
-| Rakuten Securities | Planned | Paid API |
+- Swagger UI (development): <http://localhost:8000/docs>
+- ReDoc (development): <http://localhost:8000/redoc>
+- Health check: <http://localhost:8000/api/v1/health>
+
+The first startup creates `data/screener.db`. Set `TSE_ADMIN_USER` and
+`TSE_ADMIN_PASSWORD` in `.env` to create the initial account.
+
+### 2. Frontend
+
+In a second terminal:
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+Open <http://localhost:5173>. Vite proxies `/api` requests to the FastAPI
+server on port 8000. The old Streamlit UI is archived under `legacy/` only
+as a rollback reference; it is not imported, built, or served by the FastAPI
+application. For a production build:
+
+```bash
+npm run build
+npm run preview
+```
+
+Set `VITE_API_URL` when the frontend is hosted separately, for example
+`VITE_API_URL=https://api.example.com/api/v1`.
+
+## API overview
+
+All application routes are under `/api/v1` and authenticated routes use a
+Bearer JWT returned by `POST /api/v1/auth/login`.
+
+| Area | Examples |
+|---|---|
+| Auth | `POST /auth/login`, `GET /auth/me`, `POST /auth/logout` |
+| User state | `GET/PUT /me/settings/sidebar`, `GET/PUT /me/watchlist`, `PUT /me/profit-target-rows` |
+| Market data | `GET /markets/defaults`, `GET /markets/{ticker}/ohlcv`, `GET /markets/{ticker}/fundamentals` |
+| Analysis | `POST /screeners/fundamental`, `POST /screeners/smart`, `POST /signals/scans`, `POST /backtests` |
+| Risk and targets | `POST /earnings/checks`, `POST /price-targets/analyze`, `POST /profit-targets/summarize` |
+| Portfolio | `GET /portfolio`, `POST /portfolio/refresh-prices`, `POST /portfolio/check` |
+| Alerts | `GET /alerts/channels`, `POST /alerts/scans` (delivery requires `can_send_alerts`) |
+
+The API returns JSON-safe values. Missing indicators are represented as
+`null`, and partial scan failures are returned separately from valid results.
+
+## Configuration
+
+Copy `.env.example` to `.env` and configure:
+
+```dotenv
+TSE_ADMIN_USER=admin
+TSE_ADMIN_PASSWORD=                 # set a unique value; do not copy a placeholder
+TSE_JWT_SECRET=                     # generate with: openssl rand -hex 32
+TSE_CORS_ORIGINS=http://localhost:5173
+```
+
+The API adds security headers, disables caching for authenticated/API
+responses, and applies bounded request limits. `X-Forwarded-For` is ignored by
+default; behind a reverse proxy, set `TSE_TRUSTED_PROXY_CIDRS` to the proxy
+network(s) that are allowed to supply it. External alert delivery and channel
+tests require the persisted `can_send_alerts` capability. The bootstrap admin
+receives it; existing installations can grant or revoke it with
+`python -m src.stock_screener.auth grant-alerts <username>` or
+`revoke-alerts <username>`. Startup revokes the old example bootstrap
+password if it is still present; use the CLI to set a replacement password.
+
+Auto-scan settings are consumed by the single-worker scheduler started with
+the FastAPI lifespan. It is the only supported broadcaster; the old GitHub
+Actions scan workflow is retired and performs no delivery. Keep
+`TSE_AUTO_SCAN_SCHEDULER=true` only on the single-instance deployment; ordinary
+accounts cannot enable delivery.
+
+Optional alert channels:
+
+```dotenv
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=
+SLACK_WEBHOOK_URL=
+```
+
+Use a persistent `TSE_DATA_DIR` in production. The SQLite database, JWT
+secret, caches, and per-user portfolio files are stored below that directory.
+Portfolio writes use a per-file lock plus atomic replacement. If a file is
+malformed, it is quarantined rather than silently overwritten. The pre-API
+global `portfolio.json` is never assigned automatically; an administrator may
+perform the one-time copy by setting `TSE_LEGACY_PORTFOLIO_USER_ID` to the
+chosen user's numeric ID before that user opens the portfolio.
+
+### Existing-state cutover to a persistent disk
+
+Render deployments using `TSE_DATA_DIR=/data` do not automatically import a
+legacy `./data` directory. Before switching traffic to the new service:
+
+1. Stop writes to the old service and make a filesystem backup.
+2. Verify the SQLite backup with `sqlite3 data/screener.db "PRAGMA integrity_check;"`.
+3. Copy `screener.db`, `jwt_secret.key` (unless using `TSE_JWT_SECRET`), and the
+   cache/portfolio files to the persistent disk as appropriate. Keep the old
+   copy until the new deployment is verified.
+4. Start one FastAPI worker so schema migrations run, then verify login,
+   settings, watchlists, target rows, and per-user portfolios.
+5. If intentionally importing the old global `portfolio.json`, set
+   `TSE_LEGACY_PORTFOLIO_USER_ID` to the verified destination user ID before
+   that user's first portfolio request, then confirm the copy and quarantine
+   marker state.
+6. Re-grant required alert capabilities with the CLI if the migration did not
+   preserve the `can_send_alerts` column, and only then route users to the new
+   service.
+
+If existing state is intentionally discarded, remove/rename the old state
+before first boot and bootstrap a new administrator; do not treat an empty
+`/data` directory as a successful migration.
 
 ## Deployment (Render)
 
-- **Python 3.12** (see `render.yaml` — `requires-python >=3.12`, do not downgrade).
-- Free tier: the SQLite DB (users, watchlist), JWT secret and caches live in an
-  **ephemeral** filesystem and are **lost on every redeploy**. Set
-  `TSE_ADMIN_USER` / `TSE_ADMIN_PASSWORD` in the Render dashboard (or .env) to
-  re-create the admin after each deploy.
-- Paid tier (Starter+): uncomment the disk block in `render.yaml`
-  (`mountPath: /data`) and set `TSE_DATA_DIR=/data` to persist data across
-  redeploys. Do **not** reference a disk on the free tier — deployment fails.
+`render.yaml` builds the React bundle and starts a single Uvicorn worker:
 
-## Strategies
+```bash
+npm ci --prefix frontend
+npm run build --prefix frontend
+pip install -r requirements.txt
+```
 
-### VolumeBreakout
-- Price breaks above 20-day high
-- Volume > 1.5x average (20-day)
-- Close > SMA20 (trend filter)
-- Stop-loss: 2x ATR or 7% hard stop
+Production disables Swagger/OpenAPI by default (`TSE_ENABLE_DOCS=false`).
+For production, set `TSE_JWT_SECRET`, `TSE_ADMIN_USER`, and a unique
+`TSE_ADMIN_PASSWORD` of at least 12 characters. `render.yaml` attaches the Starter service's
+persistent disk at `/data` and sets `TSE_DATA_DIR=/data`; leave the service at
+one worker while SQLite and JSON state are used. Set an explicit
+`TSE_CORS_ORIGINS` value only when the frontend is hosted on another origin,
+and configure `TSE_TRUSTED_PROXY_CIDRS` for the proxy in front of Render.
 
-### PullbackMA
-- Uptrend: Close > SMA200
-- Pullback recovery: Crosses back above SMA20/SMA50
-- RSI < 60 (not overbought)
-- Stop-loss: 2x ATR or 7% hard stop
+## Development commands
+
+```bash
+# Python tests
+pytest
+
+# Ruff
+ruff check backend src tests
+
+# Frontend production build
+npm run build --prefix frontend
+
+# CI also runs the Python tests/lint and a high-severity npm audit
+```
 
 ## License
 

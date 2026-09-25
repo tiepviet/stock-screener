@@ -2,8 +2,8 @@
 Per-user data store — server-side replacement for browser localStorage.
 
 Reads/writes are scoped to a user_id and persist in SQLite. Every device
-hitting the same Streamlit server sees the same data (true cross-device
-sync, not per-browser localStorage).
+hitting the same FastAPI server sees the same data (true cross-device sync,
+not per-browser localStorage).
 
 Public surface:
   - get_setting(user_id, key, default) -> str
@@ -18,22 +18,20 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from . import db
+from .watchlist import canonical_ticker
 
 logger = logging.getLogger(__name__)
+MAX_WATCHLIST = 500
 
 
 def _canonical(ticker: str) -> str:
-    """Strip exchange suffix so "7203.T" and "7203" are one ticker.
+    """Canonicalize a ticker for SQLite-backed user state."""
 
-    Watchlist/target rows are compared against raw UI input ("7203"),
-    so storing "7203.T" would let the same issue exist twice.
-    """
-    t = (ticker or "").strip().upper()
-    return t[:-2] if t.endswith(".T") else t
+    return canonical_ticker(ticker)
 
 
 # ---------------------------------------------------------------------------
@@ -129,11 +127,22 @@ def add_to_watchlist(user_id: int, ticker: str) -> None:
     ticker = _canonical(ticker)
     if not ticker:
         return
-    now = datetime.now(UTC).isoformat()
+    now = datetime.now(timezone.utc).isoformat()  # noqa: UP017
     with db.connect() as conn:
+        existing = conn.execute(
+            "SELECT 1 FROM watchlist WHERE user_id = ? AND ticker = ?",
+            (user_id, ticker),
+        ).fetchone()
+        if existing is not None:
+            return
+        count = conn.execute(
+            "SELECT COUNT(*) AS n FROM watchlist WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        if int(count["n"]) >= MAX_WATCHLIST:
+            raise ValueError(f"watchlist cannot exceed {MAX_WATCHLIST} symbols")
         conn.execute(
-            "INSERT OR IGNORE INTO watchlist (user_id, ticker, added_at) "
-            "VALUES (?, ?, ?)",
+            "INSERT INTO watchlist (user_id, ticker, added_at) VALUES (?, ?, ?)",
             (user_id, ticker, now),
         )
 

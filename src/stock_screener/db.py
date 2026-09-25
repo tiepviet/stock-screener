@@ -3,7 +3,7 @@ SQLite database layer — single file at data/screener.db.
 
 Holds users (bcrypt-hashed credentials) and per-user data (settings,
 target rows, watchlist). Server-side so all clients hitting the same
-Streamlit deployment see the same state.
+FastAPI deployment see the same state.
 
 Schema is created on first import via `init_db()`.
 """
@@ -43,9 +43,8 @@ if env_db_path:
 else:
     DB_PATH = DATA_DIR / "screener.db"
 
-# Single-process: Streamlit runs one Python process per session.
-# A re-entrant lock keeps concurrent threads (Streamlit script runner
-# + background scan thread) from corrupting writes.
+# Single-worker API deployment: a re-entrant lock keeps concurrent request
+# threads from corrupting writes while the service is kept on one worker.
 _db_lock = threading.RLock()
 
 _SCHEMA = """
@@ -54,7 +53,8 @@ CREATE TABLE IF NOT EXISTS users (
     username      TEXT    UNIQUE NOT NULL,
     password_hash TEXT    NOT NULL,
     created_at    TEXT    NOT NULL,
-    token_version INTEGER NOT NULL DEFAULT 0
+    token_version INTEGER NOT NULL DEFAULT 0,
+    can_send_alerts INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS user_settings (
@@ -62,6 +62,13 @@ CREATE TABLE IF NOT EXISTS user_settings (
     key     TEXT    NOT NULL,
     value   TEXT    NOT NULL,
     PRIMARY KEY (user_id, key),
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS auto_scan_state (
+    user_id     INTEGER PRIMARY KEY,
+    next_run_at REAL NOT NULL,
+    last_run_at REAL,
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 );
 
@@ -97,6 +104,9 @@ CREATE TABLE IF NOT EXISTS login_attempts (
 
 CREATE INDEX IF NOT EXISTS idx_login_attempts_lookup
     ON login_attempts(username, ip, attempted_at);
+
+CREATE INDEX IF NOT EXISTS idx_login_attempts_account
+    ON login_attempts(username, attempted_at);
 """
 
 
@@ -104,6 +114,10 @@ def init_db(db_path: Path | None = None) -> Path:
     """Create data/ dir and apply schema. Idempotent. Returns DB path."""
     path = db_path or DB_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        path.parent.chmod(0o700)
+    except OSError:
+        pass
     # Serialize schema+migration work — two threads racing the very first
     # run would both ALTER TABLE and crash on "duplicate column name".
     with _db_lock:
@@ -111,6 +125,10 @@ def init_db(db_path: Path | None = None) -> Path:
             conn.executescript(_SCHEMA)
             _migrate(conn)
             conn.commit()
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
     return path
 
 
@@ -124,6 +142,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
     if "token_version" not in cols:
         conn.execute(
             "ALTER TABLE users ADD COLUMN token_version INTEGER NOT NULL DEFAULT 0"
+        )
+    if "can_send_alerts" not in cols:
+        conn.execute(
+            "ALTER TABLE users ADD COLUMN can_send_alerts INTEGER NOT NULL DEFAULT 0"
         )
 
 

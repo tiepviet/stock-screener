@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import os
 import time
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import jwt
@@ -186,6 +186,49 @@ def test_token_version_embedded_in_jwt(_isolated_db: None) -> None:
     assert jwt_auth.verify_token(token2)["tv"] == 1
 
 
+def test_known_bootstrap_credential_is_revoked_on_startup(_isolated_db: None) -> None:
+    with db.connect() as conn:
+        conn.execute(
+            "INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, ?)",
+            ("admin", auth.hash_password("change-me-now-please"), "legacy"),
+        )
+    assert auth.revoke_known_bootstrap_credentials() == 1
+    assert auth.verify_user("admin", "change-me-now-please") is None
+
+
+def test_startup_revocation_does_not_revoke_active_environment_credential(
+    monkeypatch: pytest.MonkeyPatch, _isolated_db: None
+) -> None:
+    monkeypatch.setenv("TSE_ADMIN_USER", "boss")
+    monkeypatch.setenv("TSE_ADMIN_PASSWORD", "strong-env-password")
+    assert auth.bootstrap_admin_from_env() is not None
+    assert auth.revoke_known_bootstrap_credentials() == 0
+    assert auth.verify_user("boss", "strong-env-password") is not None
+
+
+def test_startup_revocation_covers_custom_admin_placeholder(
+    monkeypatch: pytest.MonkeyPatch, _isolated_db: None
+) -> None:
+    monkeypatch.setenv("TSE_ADMIN_USER", "boss")
+    monkeypatch.setenv("TSE_ADMIN_PASSWORD", "strong-env-password")
+    with db.connect() as conn:
+        conn.execute(
+            "INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, ?)",
+            ("boss", auth.hash_password("change-me-now-please"), "legacy"),
+        )
+    assert auth.revoke_known_bootstrap_credentials() == 1
+    assert auth.verify_user("boss", "change-me-now-please") is None
+
+
+def test_alert_capability_is_persisted_and_not_implicit(_isolated_db: None) -> None:
+    rec = auth.create_user("alice", "secret123")
+    assert rec.can_send_alerts is False
+    auth.set_alert_capability(rec.id, True)
+    refreshed = auth.get_by_username("alice")
+    assert refreshed is not None
+    assert refreshed.can_send_alerts is True
+
+
 def test_change_password_bumps_token_version(_isolated_db: None) -> None:
     rec = auth.create_user("alice", "secret123")
     assert auth.get_token_version(rec.id) == 0
@@ -266,7 +309,7 @@ def test_create_and_verify_token(_isolated_db: None) -> None:
 
 def test_verify_expired_token(_isolated_db: None) -> None:
     # Issue a token that's already expired
-    now = datetime.now(UTC)
+    now = datetime.now(timezone.utc)  # noqa: UP017
     payload = {
         "sub": "1", "username": "x", "iss": jwt_auth._ISSUER,
         "iat": int((now - timedelta(days=40)).timestamp()),
@@ -298,6 +341,14 @@ def test_verify_empty_or_garbage(_isolated_db: None) -> None:
     assert jwt_auth.verify_token("") is None
     assert jwt_auth.verify_token(None) is None
     assert jwt_auth.verify_token("not.a.jwt") is None
+
+
+def test_jwt_secret_rejects_weak_or_placeholder_values() -> None:
+    with pytest.raises(ValueError):
+        jwt_auth._validate_secret("short", "test secret")
+    with pytest.raises(ValueError):
+        jwt_auth._validate_secret("use-a-long-random-secret", "test secret")
+    assert jwt_auth._validate_secret("A9b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b9c8d7e6f5", "test secret")
 
 
 def test_secret_persists_across_loads(_isolated_db: None, tmp_path: Path) -> None:

@@ -15,6 +15,18 @@ pip-log.txt
 pip-delete-this-directory.txt
 
 # =============================================================================
+# Node / React
+# =============================================================================
+node_modules/
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/.env
+frontend/.env.*
+!frontend/.env.example
+npm-debug.log*
+
+# =============================================================================
 # Virtual Environment
 # =============================================================================
 venv/
@@ -26,8 +38,8 @@ ENV/
 # Environment & Secrets
 # =============================================================================
 .env
-.env.local
-.env.*.local
+.env.*
+!.env.example
 
 # =============================================================================
 # IDE
@@ -54,6 +66,12 @@ data/
 # Project: Portfolio (user-specific)
 # =============================================================================
 portfolio.json
+portfolio_user_*.json
+*.portfolio.lock
+.*.lock
+.*.unavailable
+.*.legacy-migrated
+*.corrupt-*
 
 # =============================================================================
 # Project: Logs
