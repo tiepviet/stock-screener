@@ -39,3 +39,10 @@ def test_format_summary_report_counts() -> None:
     assert "9984" in out
     assert "Đã scan: 3 mã" in out
     assert "Tín hiệu: 2" in out
+
+
+def test_alert_messages_are_bounded_for_provider_limits() -> None:
+    results = {f"TICKER{i}": [_sig(ticker=f"TICKER{i}")] for i in range(300)}
+    out = format_summary_report(results, "2024-01-01")
+    assert len(out) <= 3500
+    assert "[truncated]" in out

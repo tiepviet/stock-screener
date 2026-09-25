@@ -282,7 +282,7 @@ def format_summary_report(
     else:
         lines.append("Không có tín hiệu nào.")
 
-    return "\n".join(lines)
+    return _bounded_alert_message("\n".join(lines))
 
 
 # ---------------------------------------------------------------------------
