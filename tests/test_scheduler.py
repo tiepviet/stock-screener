@@ -41,7 +41,12 @@ def test_auto_scan_schedule_survives_process_state_restart(
             calls.append("scan")
             return {}
 
-        def deliver_results(self, results: dict[str, list[object]], stop_event=None) -> bool:
+        def deliver_results(
+            self,
+            results: dict[str, list[object]],
+            stop_event=None,
+            can_deliver=None,
+        ) -> bool:
             calls.append("deliver")
             return True
 
@@ -82,7 +87,12 @@ def test_reset_auto_scan_schedule_overrides_in_memory_next_run(
         def scan(self) -> dict[str, list[object]]:
             return {}
 
-        def deliver_results(self, results: dict[str, list[object]], stop_event=None) -> bool:
+        def deliver_results(
+            self,
+            results: dict[str, list[object]],
+            stop_event=None,
+            can_deliver=None,
+        ) -> bool:
             return True
 
     monkeypatch.setattr(scheduler, "AlertScanner", FakeScanner)
