@@ -31,7 +31,7 @@ There is no formal PRD or roadmap. Completion estimates are therefore observatio
 
 | Check | Result |
 |---|---|
-| `/usr/bin/python3 -m pytest -q` | 231 passed, 1 warning |
+| `/usr/bin/python3 -m pytest -q` | 233 passed, 1 warning |
 | Python runtime used locally | 3.9.6, below the declared `>=3.12` requirement |
 | Declared dependency floors | Not exercised locally |
 | `npm run build --prefix frontend` | Passed with Vite 8.3.1 |
