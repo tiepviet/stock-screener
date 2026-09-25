@@ -202,6 +202,15 @@ class SlackSender:
 # Alert formatter
 # ---------------------------------------------------------------------------
 
+_MAX_ALERT_MESSAGE_CHARS = 3500
+
+
+def _bounded_alert_message(message: str) -> str:
+    if len(message) <= _MAX_ALERT_MESSAGE_CHARS:
+        return message
+    return message[: _MAX_ALERT_MESSAGE_CHARS - 20].rstrip() + "\n…[truncated]"
+
+
 def format_signal_alert(signals: list[Signal], scan_date: str) -> str:
     """Format a list of signals into a Telegram-friendly HTML message.
 
@@ -213,7 +222,7 @@ def format_signal_alert(signals: list[Signal], scan_date: str) -> str:
         Formatted HTML string.
     """
     if not signals:
-        return f"📊 <b>{scan_date}</b> — Không có tín hiệu mới."
+        return _bounded_alert_message(f"📊 <b>{scan_date}</b> — Không có tín hiệu mới.")
 
     lines = [f"📊 <b>Tín hiệu giao dịch — {scan_date}</b>", ""]
 
@@ -236,7 +245,7 @@ def format_signal_alert(signals: list[Signal], scan_date: str) -> str:
         lines.append("")
 
     lines.append(f"📈 Tổng: {len(signals)} tín hiệu")
-    return "\n".join(lines)
+    return _bounded_alert_message("\n".join(lines))
 
 
 def format_summary_report(
