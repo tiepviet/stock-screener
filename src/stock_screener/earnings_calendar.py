@@ -36,6 +36,8 @@ class EarningsInfo:
     last_report_date: datetime | None = None
     estimated_eps: float | None = None
     actual_eps: float | None = None
+    status: str = "known"
+    error: str | None = None
 
 
 class EarningsCalendar:
@@ -78,6 +80,7 @@ class EarningsCalendar:
                 cal = yf.Ticker(normalized).calendar
             if cal is None or (isinstance(cal, pd.DataFrame) and cal.empty):
                 logger.info("No earnings data for %s", normalized)
+                info.status = "unknown"
                 return info
 
             # calendar can be a dict or DataFrame depending on yfinance version
@@ -123,6 +126,8 @@ class EarningsCalendar:
             raise
         except Exception:
             logger.exception("Failed to fetch earnings for %s", normalized)
+            info.status = "error"
+            info.error = "earnings provider request failed"
 
         # Calculate days until earnings (JST calendar day — a UTC host would
         # otherwise misjudge "today/tomorrow" by up to 9 hours)
@@ -184,12 +189,15 @@ class EarningsCalendar:
 
         for t in tickers:
             info = earnings[t]
-            if info.is_upcoming:
+            if info.status != "known" or info.next_earnings_date is None:
+                risky.append(t)
+                logger.info("%s: earnings status is %s — treating as risky", t, info.status)
+            elif info.is_upcoming:
                 risky.append(t)
                 logger.info(
                     "%s: earnings in %d days (%s) — SKIPPING",
                     t, info.days_until_earnings or 0,
-                    info.next_earnings_date.strftime("%Y-%m-%d") if info.next_earnings_date else "?",
+                    info.next_earnings_date.strftime("%Y-%m-%d"),
                 )
             else:
                 safe.append(t)

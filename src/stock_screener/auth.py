@@ -331,11 +331,13 @@ def change_password(user_id: int, new_password: str) -> None:
         raise ValueError("Password is a known placeholder; choose a unique password")
     new_hash = hash_password(new_password)
     with db.connect() as conn:
-        conn.execute(
+        cur = conn.execute(
             "UPDATE users SET password_hash = ?, token_version = token_version + 1 "
             "WHERE id = ?",
             (new_hash, user_id),
         )
+        if cur.rowcount == 0:
+            raise KeyError(f"User id={user_id} not found")
 
 
 # ---------------------------------------------------------------------------

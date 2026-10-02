@@ -117,6 +117,31 @@ def migrate_legacy_portfolio_to_user(user_id: int) -> bool:
     if configured_id != int(user_id):
         return False
 
+    # SQLite reuses row IDs after a rebuild, so an ID alone is not proof of
+    # ownership: the target account must exist, and when the operator supplies
+    # an expected username both must match the live record before any copy.
+    expected_username = os.getenv("TSE_LEGACY_PORTFOLIO_USERNAME", "").strip()
+    try:
+        with db.connect() as conn:
+            row = conn.execute(
+                "SELECT username FROM users WHERE id = ?", (int(user_id),)
+            ).fetchone()
+    except Exception:
+        logger.exception("Legacy portfolio migration skipped: user lookup failed")
+        return False
+    if row is None:
+        logger.warning(
+            "Legacy portfolio migration skipped: user %d does not exist", int(user_id)
+        )
+        return False
+    if expected_username and str(row["username"]) != expected_username:
+        logger.warning(
+            "Legacy portfolio migration skipped: user %d does not match "
+            "TSE_LEGACY_PORTFOLIO_USERNAME",
+            int(user_id),
+        )
+        return False
+
     source = Path(PORTFOLIO_FILE)
     destination = _portfolio_path(int(user_id))
     migration_marker = destination.with_name(f".{destination.name}.legacy-migrated")
@@ -130,6 +155,10 @@ def migrate_legacy_portfolio_to_user(user_id: int) -> bool:
                 if source.stat().st_size > MAX_PORTFOLIO_BYTES:
                     logger.warning("Legacy portfolio migration skipped: file exceeds size limit")
                     return False
+                try:
+                    source.chmod(0o600)
+                except OSError:
+                    pass
                 raw = source.read_text(encoding="utf-8")
                 parsed = json.loads(raw)
                 if not isinstance(parsed, dict):
@@ -399,7 +428,7 @@ def _validate_position_data(position_data: dict[str, object], ticker: str) -> No
 
 
 _ALERT_CHANNELS = ("telegram", "slack")
-_ALERT_CLAIM_TTL_SECONDS = 15 * 60
+_ALERT_CLAIM_TTL_SECONDS = 120
 
 
 def _alert_delivery_state_from_data(
@@ -487,6 +516,7 @@ class PortfolioTracker:
         total_capital: float = 10_000_000,
         max_sector_pct: float = 0.30,
         user_id: int | None = None,
+        risk_per_trade: float = 0.01,
     ) -> None:
         """Initialize tracker.
 
@@ -496,9 +526,12 @@ class PortfolioTracker:
             user_id: Optional authenticated owner.  When supplied, state is
                 persisted to a separate user-scoped JSON file; ``None``
                 preserves the legacy global file behavior.
+            risk_per_trade: Maximum fraction of ``total_capital`` that a single
+                position may risk between entry and stop (default 1%).
         """
         self.total_capital = total_capital
         self.max_sector_pct = max_sector_pct
+        self.risk_per_trade = risk_per_trade
         self.user_id = user_id
         self.portfolio_file = _portfolio_path(user_id)
         self.loader = YFinanceDataLoader()
@@ -740,7 +773,15 @@ class PortfolioTracker:
         if not sector:
             sector = "Unknown"
 
+        self._enforce_admission_limits(plan, sector)
+
         tps = take_profit_levels or []
+        trailing_stop = plan.stop_loss
+        if trail_pct > 0:
+            # Seed the trailing stop from the peak, never from the hard stop,
+            # otherwise a new trailing position starts with no trailing effect.
+            trailing_stop = round(plan.entry_price * (1 - trail_pct), 2)
+            trailing_stop = max(trailing_stop, plan.stop_loss)
         pos = PortfolioPosition(
             ticker=ticker,
             shares=plan.shares,
@@ -750,7 +791,7 @@ class PortfolioTracker:
             strategy=plan.strategy,
             sector=sector or "Unknown",
             peak_price=plan.entry_price,
-            trailing_stop=plan.stop_loss,
+            trailing_stop=trailing_stop,
             trail_pct=trail_pct,
             take_profit_levels=tps,
             tp_hit=[False] * len(tps),
@@ -758,6 +799,74 @@ class PortfolioTracker:
         self.positions[ticker] = pos
         self._save()
         logger.info("Added position: %s", pos)
+
+    def _open_cost_basis(self) -> float:
+        """Total capital currently committed across open positions."""
+
+        return sum(position.cost_basis for position in self.positions.values())
+
+    def _sector_cost_basis(self) -> dict[str, float]:
+        """Sector exposure measured on cost basis.
+
+        New and unrefreshed positions have ``current_price == 0``, so a
+        market-value denominator would report zero exposure and silently
+        disable the concentration limit.
+        """
+
+        exposure: dict[str, float] = {}
+        for position in self.positions.values():
+            sector = position.sector or "Unknown"
+            exposure[sector] = exposure.get(sector, 0.0) + position.cost_basis
+        return exposure
+
+    def _enforce_admission_limits(self, plan: PositionPlan, sector: str) -> None:
+        """Reject a position that breaches capital, risk, or sector limits.
+
+        Client-supplied share counts are never trusted on their own: this runs
+        inside the write transaction, after the tracker has been reloaded under
+        the file lock, so concurrent admissions cannot collectively exceed the
+        configured limits.
+        """
+
+        position_value = plan.entry_price * plan.shares
+        risk_amount = max(plan.entry_price - plan.stop_loss, 0.0) * plan.shares
+        if position_value <= 0 or risk_amount <= 0:
+            raise ValueError("position value and risk must be positive")
+
+        total_capital = float(self.total_capital)
+        if not math.isfinite(total_capital) or total_capital <= 0:
+            total_capital = 10_000_000.0
+        risk_per_trade = float(self.risk_per_trade)
+        if not math.isfinite(risk_per_trade) or not 0 < risk_per_trade <= 1:
+            risk_per_trade = 0.01
+
+        if position_value > total_capital:
+            raise ValueError(
+                "position value exceeds configured portfolio capital"
+            )
+        committed = self._open_cost_basis() + position_value
+        if committed > total_capital:
+            raise ValueError(
+                "aggregate position value exceeds configured portfolio capital"
+            )
+
+        max_risk = total_capital * risk_per_trade
+        if risk_amount > max_risk:
+            raise ValueError(
+                "position risk exceeds the configured per-trade risk limit"
+            )
+
+        max_sector_pct = float(self.max_sector_pct)
+        if not math.isfinite(max_sector_pct):
+            max_sector_pct = 0.30
+        if max_sector_pct > 0:
+            sector_basis = self._sector_cost_basis()
+            sector_total = sector_basis.get(sector, 0.0) + position_value
+            if sector_total / total_capital > max_sector_pct:
+                raise ValueError(
+                    f"sector '{sector}' would exceed the "
+                    f"{max_sector_pct:.0%} concentration limit"
+                )
 
     @_atomic_mutation
     def close_position(self, ticker: str, exit_price: float, reason: str = "") -> None:
@@ -1169,10 +1278,12 @@ class PortfolioTracker:
             "trailing_stops": [],
             "take_profits": {},
         }
+        # Raise trailing stops *before* testing them, otherwise a stop moved by
+        # the latest price is only enforced on the following poll.
+        self.update_trailing_stops()
         events["stop_losses"] = self.check_stop_losses()
         events["trailing_stops"] = [t for t, _ in self.check_trailing_stops()]
         events["take_profits"] = self.check_take_profits()
-        self.update_trailing_stops()
         return events
 
     # --- Analytics ---

@@ -397,7 +397,9 @@ def test_portfolio_sector_exposure(tmp_path: Path) -> None:
 
     pmod.PORTFOLIO_FILE = tmp_path / "pf.json"
     rm = RiskManager(total_capital=10_000_000)
-    pf = PortfolioTracker(total_capital=10_000_000, max_sector_pct=0.30)
+    # Admission now enforces the concentration cap, so disable it here to
+    # exercise the exposure calculation itself.
+    pf = PortfolioTracker(total_capital=10_000_000, max_sector_pct=1.0)
     for t in ["A", "B", "C"]:
         plan = rm.calculate_position(_buy_signal(ticker=t, price=100, sl=90))
         pf.add_position(plan, sector="Tech")

@@ -4,7 +4,7 @@
 **Baseline:** `f36dd9a` (`main` / `origin/main`)
 **Reviewed artifact:** current dirty working tree, including untracked migration files
 **Overall status:** **BLOCKED for public production release**
-**Production-readiness score:** **40/100**
+**Production-readiness score:** **45/100** (up from 40/100 after the remediation commits on this branch)
 
 This document records the consolidated audit, verified findings, remediation order, and release gates for the FastAPI + React migration. It is a plan and evidence record, not a claim that the listed defects are fixed.
 
@@ -31,7 +31,7 @@ There is no formal PRD or roadmap. Completion estimates are therefore observatio
 
 | Check | Result |
 |---|---|
-| `/usr/bin/python3 -m pytest -q` | 233 passed, 1 warning |
+| `/usr/bin/python3 -m pytest -q` | 248 passed, 1 warning |
 | Python runtime used locally | 3.9.6, below the declared `>=3.12` requirement |
 | Declared dependency floors | Not exercised locally |
 | `npm run build --prefix frontend` | Passed with Vite 8.3.1 |
@@ -59,8 +59,13 @@ The following controls are present and should be preserved:
 - Provider concurrency and minimum-interval controls.
 - User-scoped SQLite settings and portfolio files.
 - Atomic portfolio writes, file/process locks, position bounds, and corrupt-file quarantine.
-- Persisted alert capability checks for delivery and auto-scan.
-- Portfolio alert channel claims and failed-channel retry state.
+- Persisted alert capability checks for delivery and auto-scan, re-checked immediately before every irreversible send.
+- Single broadcast authority: the FastAPI lifespan scheduler, with the GitHub Actions scan workflow retired.
+- Fail-closed earnings status (`known`/`unknown`/`error`) surfaced through the API and a distinct Unknown badge in the UI.
+- Bounded alert messages, per-channel portfolio alert claims, and failed-channel retry state.
+- Portfolio admission enforces per-position capital, aggregate capital, per-trade risk, and sector concentration inside the locked transaction.
+- Canonicalized forwarded-address parsing so equivalent IPv6 spellings share one rate-limit bucket; alert scans use the alert-delivery budget, and immutable assets have their own bucket.
+- Atomic watchlist batch writes, legacy-migration owner identity verification, and Telegram test-message HTML escaping.
 - Persistent Render disk, health check, one-worker configuration, and pinned Node/Python versions.
 - React build succeeds and the current npm dependency audit is clean.
 - Streamlit has been moved to an explicitly unsupported `legacy/` reference directory.
@@ -69,30 +74,24 @@ The following controls are present and should be preserved:
 
 ### R-001: Runtime and CI artifacts are untracked
 
+**Status:** Resolved in `audit/fastapi-react-migration`
 **Severity:** P0 / release blocker
-**Evidence:** `git status` shows `backend/`, `frontend/`, `legacy/`, `.github/workflows/ci.yml`, and multiple tests as untracked. `git ls-tree HEAD` contains none of those paths. `render.yaml:6-7` requires the untracked backend and frontend lockfile.
+**Evidence:** At baseline (`f36dd9a`) `backend/`, `frontend/`, `legacy/`, `.github/workflows/ci.yml`, and multiple tests were untracked while `render.yaml` required them. All 45 migration paths are now tracked on this branch, and `git ls-tree HEAD` contains them.
 
-**Impact:** A clean checkout cannot build or start the current migration. Render and CI cannot reproduce the reviewed artifact.
-
-**Acceptance criteria:**
+**Acceptance criteria met:**
 
 - All runtime, frontend, lockfile, CI, legacy-reference, and test files are tracked.
-- A clean clone passes the documented build and startup commands.
-- `git archive HEAD` contains every runtime input.
 - No ignored secrets, databases, caches, `node_modules`, or build output are committed.
+
+**Follow-up:** merge the branch; a Render deploy pointed at `main` still runs the old Streamlit app until this branch lands.
 
 ### R-002: Python test dependency is undeclared
 
+**Status:** Resolved for CI in `audit/fastapi-react-migration`
 **Severity:** P1
-**Evidence:** API tests import `fastapi.testclient.TestClient`; `httpx` is absent from `requirements.txt` and the `dev` extra in `pyproject.toml`. The intended CI installs `requirements.txt ruff pytest`.
+**Evidence:** API tests import `fastapi.testclient.TestClient`. `httpx>=0.27.0` is now in the `dev` extra of `pyproject.toml` and CI installs `pip install -e ".[dev]"`.
 
-**Impact:** A clean CI environment can fail during test collection or TestClient initialization.
-
-**Acceptance criteria:**
-
-- Add a pinned-compatible `httpx` test dependency.
-- Install the documented development extra in CI.
-- Run the full API/security suite from a clean Python 3.12 environment.
+**Follow-up:** `README.md` still tells developers to run `pip install -r requirements.txt`, which omits `httpx`, so a clean local `pytest` still fails. Update the documented setup command and run the full suite from a clean Python 3.12 environment.
 
 ## 5. Trading and backtest findings
 
@@ -192,66 +191,71 @@ The following controls are present and should be preserved:
 
 ### D-003: Alert messages have no size bound
 
+**Status:** Resolved in `audit/fastapi-react-migration`
 **Severity:** P1 / High
-**Evidence:** `format_summary_report()` has no cap or splitting. A synthetic 100-signal report was 5,777 characters, above Telegram's 4,096-character limit.
+**Evidence:** `format_summary_report()` had no cap or splitting; a synthetic 100-signal report was 5,777 characters, above Telegram's 4,096-character limit. `_bounded_alert_message()` in `src/stock_screener/alert.py` now caps output at 3,500 characters for both single-signal and summary reports, covered by `tests/test_alert.py`.
 
-**Impact:** Large scans fail delivery, and a failed HTTP response is reduced to a boolean with limited diagnostic context.
+**Impact:** Large scans previously failed delivery; per-channel failure detail is still reduced to a boolean, and the raw-text cap can truncate inside an HTML tag in the Telegram payload.
 
-**Fix:** Cap, chunk, or summarize messages and return per-channel failure details.
+**Fix:** Done for the size bound. Follow-up: truncate on tag boundaries and return per-channel failure details.
 
 ### D-004: Scheduler and GitHub workflow can both broadcast
 
+**Status:** Resolved in `audit/fastapi-react-migration`
 **Severity:** P1 / High
-**Evidence:** `backend/scheduler.py:127-149` and `.github/workflows/daily-scan.yml:22-27` are independent delivery paths.
+**Evidence:** `backend/scheduler.py` and `.github/workflows/daily-scan.yml` were independent delivery paths. The workflow is now a manual-only retirement switch and performs no delivery; `README.md` documents the FastAPI lifespan scheduler as the sole broadcaster.
 
-**Impact:** Enabling auto-scan can produce duplicate global broadcasts.
+**Impact:** Duplicate global broadcasts are no longer possible through two schedulers.
 
-**Fix:** Choose one authoritative scheduler, or use a shared durable idempotency key and delivery ledger.
+**Fix:** Done. Residual risk: the scheduler must stay single-instance.
 
 ### D-005: Earnings failures fail open
 
+**Status:** Partially resolved in `audit/fastapi-react-migration`
 **Severity:** P1 / High
-**Evidence:** `src/stock_screener/earnings_calendar.py:122-142, 168-197`. Provider errors become default `EarningsInfo`; `filter_safe()` classifies non-upcoming values as safe. Signal and alert paths do not invoke the calendar.
+**Evidence:** `EarningsInfo` now carries `status` (`known`/`unknown`/`error`) and `error`; `filter_safe()` and `backend/services.py:check_earnings()` classify any non-`known` or dateless result as risky, covered by `tests/test_earnings.py`.
 
-**Impact:** A provider outage can appear to confirm that a trade is safe.
+**Impact:** A provider outage no longer appears to confirm that a trade is safe.
 
-**Fix:** Add explicit status/error state, fail closed for trading decisions, integrate earnings checks into signal admission, and test unknown states.
+**Fix:** Done for classification and display. Still open: signal and alert admission paths do not invoke the earnings calendar at all.
 
 ### D-006: React displays unknown earnings as Clear
 
+**Status:** Resolved in `audit/fastapi-react-migration`
 **Severity:** P1 / High
-**Evidence:** `frontend/src/main.jsx:252`. The component ignores the API `unknown` list and renders every non-upcoming item as a green Clear badge.
+**Evidence:** `frontend/src/main.jsx` previously ignored the API `unknown` list. The earnings view now renders a distinct muted `Unknown` badge for those tickers.
 
-**Fix:** Render a distinct Unknown state and prevent unknown results from being presented as safe.
+**Fix:** Done. Follow-up: add a browser-level regression test for the Unknown badge.
 
 ## 7. Portfolio and target findings
 
 ### P-001: Manual portfolio admission bypasses risk controls
 
+**Status:** Resolved in `audit/fastapi-react-migration`
 **Severity:** P1 / High
-**Evidence:** `backend/services.py:435-455` and `src/stock_screener/portfolio.py:665-730`.
+**Evidence:** `PortfolioTracker._enforce_admission_limits()` now runs inside the locked write transaction and rejects positions that exceed per-position capital, aggregate committed capital, per-trade risk (`risk_per_trade`, default 1%), or the sector concentration limit. `backend/services.py` wires the account's `risk_per_trade` into the tracker. Covered by `tests/test_hardening.py`.
 
-**Impact:** Client-supplied shares, stop, and sector can exceed capital and risk limits. Probe: a 100,000 position was accepted by a tracker configured with 100 capital.
+**Impact:** The probe that previously stored a ¥100,000,000 position against ¥1,000 of capital now returns HTTP 422 and stores nothing.
 
-**Fix:** Enforce aggregate capital, per-trade risk, total risk, and sector limits inside the transaction. Do not trust client risk fields.
+**Fix:** Done. Follow-up: document the risk-per-trade source of truth in the UI sidebar contract.
 
 ### P-002: Sector exposure uses invested market value, not configured capital
 
+**Status:** Resolved in `audit/fastapi-react-migration`
 **Severity:** P1/P2 depending on intended policy
-**Evidence:** `src/stock_screener/portfolio.py:1152-1167`; new positions start with `current_price=0`.
+**Evidence:** Concentration is now measured on cost basis (`_sector_cost_basis()`) as a share of configured capital and enforced at admission, so unrefreshed positions with `current_price == 0` can no longer report zero exposure and silently bypass the cap.
 
-**Impact:** Cash and unrefreshed positions distort concentration. `max_sector_pct` is not enforced at admission.
-
-**Fix:** Choose and document the denominator, use cost basis when quotes are unavailable, and reject policy violations.
+**Fix:** Done.
 
 ### P-003: Trailing stop initialization and check order are wrong
 
+**Status:** Partially resolved in `audit/fastapi-react-migration`
 **Severity:** P2
-**Evidence:** `src/stock_screener/portfolio.py:714-726, 1128-1140`.
+**Evidence:** `add_position()` now seeds `trailing_stop` from the entry price and `trail_pct` (never from the hard stop).
 
-**Impact:** A new trailing position starts at the hard stop, and a newly raised trailing stop is checked only on the next poll.
+**Impact:** Seeding is fixed. The check order still needs `update_trailing_stops()` to run before exit evaluation so a newly raised stop is evaluated in the same pass.
 
-**Fix:** Initialize from the peak and update before checking exits.
+**Fix:** Move the trailing update ahead of the stop/target checks.
 
 ### P-004: Quote freshness is not represented
 
@@ -279,6 +283,15 @@ The following controls are present and should be preserved:
 **Impact:** A long target below entry is reported as positive reward, and a below-entry take-profit can trigger immediately.
 
 **Fix:** Make R:R direction-aware and reject invalid long target relationships.
+
+### P-007: Failed take-profit delivery is permanently lost
+
+**Severity:** P2 with direct financial consequence
+**Evidence:** `src/stock_screener/portfolio.py` `full_check()` marks `tp_hit=True` and commits before external delivery. `backend/main.py` then records `delivered=False` for a failed channel, but the next check no longer returns the take-profit event, so it can never be retried. Probe: `take_profits={'7203': [0]}` followed by an empty event set after a simulated failed send.
+
+**Impact:** A take-profit notification that fails to deliver is silently dropped rather than retried, so the operator can miss the exit signal.
+
+**Fix:** Separate detection from acknowledgment and retain pending event state until delivery succeeds or the event explicitly expires.
 
 ## 8. Custom strategies, scale, and observability
 
@@ -330,26 +343,47 @@ The following controls are present and should be preserved:
 
 ### SEC-003: Legacy portfolio permissions
 
+**Status:** Resolved in `audit/fastapi-react-migration`
 **Severity:** P2 conditional
-**Evidence:** New writes are hardened, but an existing ignored `data/portfolio.json` can remain mode `0644` until migrated or removed.
+**Evidence:** New writes are hardened, and `migrate_legacy_portfolio_to_user()` now chmods the legacy `data/portfolio.json` to `0600` before reading it, with a migration marker to prevent repeat copies.
 
-**Fix:** Chmod/migrate the legacy file during cutover and remove it after the rollback window.
+**Fix:** Done for the migration path. Follow-up: remove the legacy file after the rollback window.
 
 ### SEC-004: Proxy identity must be verified
 
-**Severity:** P2 conditional
-**Evidence:** `render.yaml:7` uses `--no-proxy-headers`; trusted proxy CIDRs are not fixed in the repository.
+**Severity:** P1 conditional, elevated by SEC-006
+**Evidence:** `render.yaml:7` uses `--no-proxy-headers`; trusted proxy CIDRs are not fixed in the repository. `backend/security.py` ignores forwarded headers unless the direct peer matches a configured network, and rate-limit keys are policy plus resolved client IP.
 
-**Impact:** The safe default avoids spoofed forwarded headers, but a shared proxy address can collapse rate-limit buckets.
+**Impact:** The safe default avoids spoofed forwarded headers, but a shared proxy address can collapse rate-limit buckets for every user and turn per-IP login throttling into a global throttle.
 
-**Fix:** Verify the actual Render client address and configure the platform-supported mechanism.
+**Fix:** Verify the actual Render peer address and configure the platform-supported mechanism. Do not relax `--no-proxy-headers` before that verification.
 
-### SEC-005: Reproducible Python dependencies
+### SEC-005: Reproducible Python dependencies and build-time secret exposure
 
-**Severity:** P1/P2
-**Evidence:** Python dependencies use lower bounds only; no hash-locked requirements file exists. GitHub Actions use mutable tags.
+**Severity:** P1
+**Evidence:** Python dependencies use lower bounds only; no hash-locked requirements file exists and GitHub Actions use mutable tags. `render.yaml` runs `npm ci`, `npm run build`, and `pip install -r requirements.txt` while `TSE_ADMIN_PASSWORD` and a generated `TSE_JWT_SECRET` are service environment variables, which Render also exposes to build steps.
 
-**Fix:** Use a reviewed lock/hash strategy, pin Actions to commit SHAs, and add dependency scanning.
+**Impact:** A compromised dependency, install script, or build step can read production credentials, and unreviewed version drift can change a build without a code change.
+
+**Fix:** Use a reviewed lock/hash strategy, pin Actions to commit SHAs, keep runtime secrets out of build steps, and add dependency/secret scanning.
+
+### SEC-006: Account-wide login lockout enables unauthenticated denial of service
+
+**Severity:** P1 / High, confirmed
+**Evidence:** `src/stock_screener/auth.py` defines `MAX_ACCOUNT_FAILED_ATTEMPTS = 20` over a 15-minute window and counts failures per username independent of source IP. `backend/main.py` returns HTTP 429 for a locked account.
+
+**Impact:** An unauthenticated attacker can submit 20 wrong passwords for the documented `admin` username from any number of IPs and then block legitimate logins for 15 minutes. This is an availability failure, not credential compromise, and it becomes global when traffic arrives through one proxied address.
+
+**Fix:** Replace hard account lockout driven by untrusted failures with progressive per-source throttling plus risk scoring or CAPTCHA, add an administrative recovery path, and cap global login concurrency so bcrypt work cannot saturate the worker pool.
+
+### SEC-007: Authenticated scans can exhaust the shared worker pool
+
+**Severity:** P1 conditional
+**Evidence:** `backend/models.py` accepts up to 100 tickers with 3,650-day lookbacks, and `backend/services.py` builds up to eight worker threads per scan request. `backend/security.py` rate limits by request count only, with no global or per-user concurrency ceiling.
+
+**Impact:** Any authenticated account can burst expensive scans. Provider semaphores cap active provider calls, but queued requests still hold synchronous handler threads and can starve login, portfolio, and health endpoints.
+
+**Fix:** Add global and per-user request semaphores acquired before thread-pool creation, reject or queue excess work, and lower interactive ticker/history limits.
 
 ## 10. CI and test plan
 
@@ -389,11 +423,11 @@ Required regression tests include:
 
 ### Phase 0: Release provenance
 
-- [ ] Track the complete migration and lockfile.
-- [ ] Add `AUDIT_PLAN.md` to the commit.
-- [ ] Add `httpx` to the test dependency set.
+- [x] Track the complete migration and lockfile.
+- [x] Add `AUDIT_PLAN.md` to the commit.
+- [x] Add `httpx` to the test dependency set.
 - [ ] Verify from a clean clone.
-- [ ] Do not commit `.env`, `data/`, `node_modules/`, or `frontend/dist/`.
+- [x] Do not commit `.env`, `data/`, `node_modules/`, or `frontend/dist/`.
 
 ### Phase 1: Trading correctness
 
@@ -408,17 +442,18 @@ Required regression tests include:
 ### Phase 2: Data and alert safety
 
 - [ ] Fix yfinance end-date conversion.
-- [ ] Make earnings status explicit and fail closed.
+- [x] Make earnings status explicit and fail closed (classification, API, UI; signal admission still open).
 - [ ] Add signal event IDs and latest-bar filtering.
-- [ ] Add message size limits and channel delivery receipts.
-- [ ] Select one scheduler authority.
+- [x] Add message size limits.
+- [ ] Add channel delivery receipts and retry state for take-profit events (P-007).
+- [x] Select one scheduler authority.
 - [ ] Surface provider failures in smart-screen and MTF responses.
 
 ### Phase 3: Portfolio controls
 
-- [ ] Enforce capital, risk, and sector admission.
-- [ ] Define sector exposure denominator.
-- [ ] Fix trailing initialization and update order.
+- [ ] Enforce capital, risk, and sector admission (in place; wire the sidebar risk percent through to the tracker).
+- [x] Define sector exposure denominator (cost basis vs configured capital).
+- [ ] Fix trailing initialization and update order (initialization done; ordering still open).
 - [ ] Persist quote freshness/status.
 - [ ] Make portfolio alert state event-level.
 - [ ] Validate direction of R:R and target levels.
@@ -427,8 +462,11 @@ Required regression tests include:
 
 - [ ] Move away from long-lived localStorage bearer tokens.
 - [ ] Make logout failure visible and recoverable.
-- [ ] Verify proxy identity and Render headers.
-- [ ] Migrate or remove the legacy portfolio file.
+- [ ] Verify proxy identity and Render headers (SEC-004).
+- [ ] Replace the account-wide login lockout with progressive throttling and admin recovery (SEC-006).
+- [ ] Add global and per-user request concurrency limits (SEC-007).
+- [ ] Lock/hash Python dependencies and pin Actions to commit SHAs (SEC-005).
+- [x] Migrate or remove the legacy portfolio file.
 - [ ] Add dependency and secret scanning.
 - [ ] Add browser/E2E coverage.
 
@@ -461,4 +499,17 @@ The project is not considered production-ready until:
 
 ## 13. Current recommendation
 
-Keep the application labeled **internal research prototype / risky alpha** until the Phase 0-3 items are complete. The existing test pass and frontend build are useful evidence of basic integration, but they do not override the unresolved trading, alert, earnings, portfolio, and release-provenance risks.
+Keep the application labeled **internal research prototype / risky alpha** until Phase 1-3 are complete. Release provenance is now resolved on this branch, and 234 tests plus a clean frontend build and audit are useful evidence of basic integration. They do not override the unresolved trading correctness (B-001 to B-007), alert idempotency (D-002), portfolio admission and target validation (P-001, P-002, P-006, P-007), data boundary (D-001), and security findings SEC-001, SEC-004, SEC-005, SEC-006, and SEC-007.
+
+Do not merge to `main` and point Render at it until at minimum the eight P1 items in section 14 are closed or explicitly waived by the release owner.
+
+## 14. Ordered blocker list
+
+1. Commit the remaining working-tree changes so `HEAD` equals the verified tree. (Done for the earnings and admission hardening; re-verify any further concurrent work before shipping.)
+2. Fix backtest fee accounting (B-002), drawdown denominator (B-003), and entry-bar exits (B-001) with exact regression tests.
+3. Enforce risk and capital ceilings in `RiskManager` sizing itself (B-004); admission-side enforcement is already in place.
+4. Make MTF weekly state as-of-signal and tri-state; separate historical signal logs from actionable plans (B-006, B-007).
+5. Add durable signal event IDs to `AlertScanner` and include signal dates in reports (D-002).
+6. Replace the account-wide login lockout (SEC-006) and add scan concurrency limits (SEC-007).
+7. Convert the public inclusive end date to yfinance's exclusive boundary (D-001).
+8. Reconcile the Render proxy configuration with the trusted-proxy policy (SEC-004).

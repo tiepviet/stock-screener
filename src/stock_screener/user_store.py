@@ -124,26 +124,40 @@ def get_watchlist(user_id: int) -> list[str]:
 
 
 def add_to_watchlist(user_id: int, ticker: str) -> None:
-    ticker = _canonical(ticker)
-    if not ticker:
+    add_watchlist_many(user_id, [ticker])
+
+
+def add_watchlist_many(user_id: int, tickers: list[str]) -> None:
+    """Insert a batch atomically, enforcing the per-user cap in one txn."""
+
+    canonical: list[str] = []
+    for raw in tickers:
+        value = _canonical(raw)
+        if value and value not in canonical:
+            canonical.append(value)
+    if not canonical:
         return
     now = datetime.now(timezone.utc).isoformat()  # noqa: UP017
     with db.connect() as conn:
-        existing = conn.execute(
-            "SELECT 1 FROM watchlist WHERE user_id = ? AND ticker = ?",
-            (user_id, ticker),
-        ).fetchone()
-        if existing is not None:
+        existing = {
+            str(row["ticker"])
+            for row in conn.execute(
+                "SELECT ticker FROM watchlist WHERE user_id = ?", (user_id,)
+            ).fetchall()
+        }
+        additions = [ticker for ticker in canonical if ticker not in existing]
+        if not additions:
             return
-        count = conn.execute(
-            "SELECT COUNT(*) AS n FROM watchlist WHERE user_id = ?",
-            (user_id,),
-        ).fetchone()
-        if int(count["n"]) >= MAX_WATCHLIST:
-            raise ValueError(f"watchlist cannot exceed {MAX_WATCHLIST} symbols")
-        conn.execute(
+        count = len(existing)
+        room = MAX_WATCHLIST - count
+        if room < len(additions):
+            raise ValueError(
+                f"watchlist cannot exceed {MAX_WATCHLIST} symbols "
+                f"({room} slot(s) available, {len(additions)} requested)"
+            )
+        conn.executemany(
             "INSERT INTO watchlist (user_id, ticker, added_at) VALUES (?, ?, ?)",
-            (user_id, ticker, now),
+            [(user_id, ticker, now) for ticker in additions],
         )
 
 

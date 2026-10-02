@@ -360,7 +360,15 @@ def check_earnings(payload: Any) -> tuple[dict[str, Any], list[str], list[str]]:
     risky: list[str] = []
     for ticker in payload.tickers:
         info = results.get(ticker)
-        (risky if info is not None and info.is_upcoming else safe).append(ticker)
+        if (
+            info is None
+            or info.status != "known"
+            or info.next_earnings_date is None
+            or info.is_upcoming
+        ):
+            risky.append(ticker)
+        else:
+            safe.append(ticker)
     return results, safe, risky
 
 
@@ -433,10 +441,17 @@ def portfolio_tracker(user_id: int, settings: dict[str, Any] | None = None) -> P
         max_sector = 0.30
     if not math.isfinite(max_sector):
         max_sector = 0.30
+    try:
+        risk_per_trade = float(settings.get("risk_fraction", 0.01))
+    except (TypeError, ValueError):
+        risk_per_trade = 0.01
+    if not math.isfinite(risk_per_trade) or not 0 < risk_per_trade <= 1:
+        risk_per_trade = 0.01
     return PortfolioTracker(
         total_capital=capital,
         max_sector_pct=max(0.0, min(max_sector, 1.0)),
         user_id=user_id,
+        risk_per_trade=risk_per_trade,
     )
 
 
@@ -462,6 +477,12 @@ def add_portfolio_position(
             take_profit_levels=payload.take_profit_levels,
             trail_pct=payload.trail_pct,
         )
+    except ValueError:
+        # Admission-limit and duplicate rejections are caller-correctable; the
+        # route maps them to 422 with the reason intact.
+        raise
+    except ProviderBusyError:
+        raise
     except Exception as exc:
         logger.exception("Could not add portfolio position")
         raise ServiceError("could not add portfolio position") from exc

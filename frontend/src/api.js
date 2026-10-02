@@ -55,7 +55,7 @@ async function request(path, options = {}) {
     const detail = formatApiDetail(payload?.detail || payload?.message) || (typeof payload === 'string' ? payload : null)
     if (response.status === 401 && requestToken && getToken() === requestToken) {
       setToken(null)
-      window.dispatchEvent(new Event('tse-auth-expired'))
+      window.dispatchEvent(new CustomEvent('tse-auth-expired', { detail: { token: requestToken } }))
     }
     throw new ApiError(detail || `Request failed (${response.status})`, response.status, payload)
   }

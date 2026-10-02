@@ -96,7 +96,13 @@ def resolve_client_ip(request: Request) -> str:
 
     forwarded = request.headers.get("x-forwarded-for", "")
     candidates = [item.strip()[:128] for item in forwarded.split(",") if item.strip()]
-    valid = [item for item in candidates if _valid_ip(item) is not None]
+    # Canonicalize so equivalent spellings (notably IPv6) cannot be used to mint
+    # extra rate-limit buckets for the same client.
+    valid = [
+        normalized
+        for item in candidates
+        if (normalized := _valid_ip(item)) is not None
+    ]
     if not valid:
         return peer
 
@@ -162,6 +168,10 @@ def _max_request_chunks() -> int:
 def _rate_limit_for(path: str) -> tuple[str, int, float]:
     """Choose a stable policy based on endpoint cost, not the concrete path."""
 
+    if path.startswith("/assets/"):
+        # Content-hashed bundles are immutable and served from the same worker;
+        # charging them to the API budget lets a page load starve real API calls.
+        return "assets", _int_env("TSE_ASSET_RATE_LIMIT", 600, 1, 100_000), 60.0
     if path in {"/health", "/api/v1/health", "/api/v1/auth/setup-status"}:
         return "public", _int_env("TSE_PUBLIC_RATE_LIMIT", 120, 1, 10_000), 60.0
     if path.endswith("/auth/login"):
@@ -174,6 +184,10 @@ def _rate_limit_for(path: str) -> tuple[str, int, float]:
     )
     if path.startswith(portfolio_provider_paths):
         return "provider", _int_env("TSE_PROVIDER_RATE_LIMIT", 30, 1, 10_000), 60.0
+    if path == "/api/v1/alerts/scans":
+        # This endpoint can broadcast to Telegram/Slack, so it must use the
+        # tighter irreversible-side-effect budget, not the provider budget.
+        return "alert_delivery", _int_env("TSE_ALERT_RATE_LIMIT", 10, 1, 10_000), 60.0
     provider_prefixes = (
         "/api/v1/markets/",
         "/api/v1/screeners/",
@@ -182,7 +196,6 @@ def _rate_limit_for(path: str) -> tuple[str, int, float]:
         "/api/v1/backtests",
         "/api/v1/price-targets/",
         "/api/v1/profit-targets/",
-        "/api/v1/alerts/scans",
     )
     if path.startswith(provider_prefixes):
         return "provider", _int_env("TSE_PROVIDER_RATE_LIMIT", 30, 1, 10_000), 60.0

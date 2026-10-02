@@ -196,6 +196,14 @@ def _require_alert_delivery(user: CurrentUser) -> None:
         )
 
 
+def _telegram_html(message: str) -> str:
+    """Escape user-controlled text before embedding it in Telegram HTML."""
+
+    import html
+
+    return f"<b>{html.escape(message, quote=False)}</b>"
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     # ``run_in_threadpool`` prevents SQLite schema creation and bcrypt bootstrap
@@ -523,8 +531,7 @@ def _register_routes(router: APIRouter) -> None:
         user: CurrentUser = Depends(get_current_user),
     ) -> list[str]:
         try:
-            for ticker in payload.tickers:
-                user_store.add_to_watchlist(user.id, ticker)
+            user_store.add_watchlist_many(user.id, list(payload.tickers))
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return safe_value(user_store.get_watchlist(user.id))
@@ -808,6 +815,8 @@ def _register_routes(router: APIRouter) -> None:
             try:
                 with services.provider_slot():
                     sector = (tracker.loader.fetch_fundamentals(payload.ticker) or {}).get("sector") or ""
+            except ProviderBusyError:
+                raise
             except Exception:
                 sector = "Unknown"
             if not sector:
@@ -815,7 +824,10 @@ def _register_routes(router: APIRouter) -> None:
         with tracker.transaction() as locked:
             if payload.ticker in locked.positions:
                 raise HTTPException(status_code=409, detail="Position already exists")
-            services.add_portfolio_position(locked, payload, sector=sector)
+            try:
+                services.add_portfolio_position(locked, payload, sector=sector)
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
             response = _portfolio_response(locked)
         return response
 
@@ -927,7 +939,7 @@ def _register_routes(router: APIRouter) -> None:
                     sender = TelegramSender() if channel == "telegram" else SlackSender()
                     try:
                         sent = bool(
-                            sender.send(f"<b>{message}</b>")
+                            sender.send(_telegram_html(message))
                             if channel == "telegram"
                             else sender.send(message)
                         )

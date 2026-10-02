@@ -278,6 +278,8 @@ def test_portfolio_transactions_do_not_lose_concurrent_positions(
 def test_legacy_portfolio_migration_requires_explicit_owner(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "legacy-owner.db")
+    monkeypatch.setattr(jwt_auth, "_SECRET_PATH", tmp_path / "legacy-owner.key")
     monkeypatch.setattr(portfolio, "PORTFOLIO_FILE", tmp_path / "portfolio.json")
     legacy = {
         "positions": {},
@@ -288,11 +290,18 @@ def test_legacy_portfolio_migration_requires_explicit_owner(
     assert portfolio.migrate_legacy_portfolio_to_user(4) is False
     assert not portfolio._portfolio_path(4).exists()
 
+    # Migration also requires the destination user to exist.
     monkeypatch.setenv("TSE_LEGACY_PORTFOLIO_USER_ID", "4")
-    assert portfolio.migrate_legacy_portfolio_to_user(4) is True
-    assert portfolio._portfolio_path(4).exists()
-    assert portfolio.PORTFOLIO_FILE.exists()
-    destination = portfolio._portfolio_path(4)
-    destination.unlink()
     assert portfolio.migrate_legacy_portfolio_to_user(4) is False
+    assert not portfolio._portfolio_path(4).exists()
+
+    user = auth.create_user("legacy-owner", "correct-password")
+    monkeypatch.setenv("TSE_LEGACY_PORTFOLIO_USER_ID", str(user.id))
+    monkeypatch.setenv("TSE_LEGACY_PORTFOLIO_USERNAME", "legacy-owner")
+    destination = portfolio._portfolio_path(user.id)
+    assert portfolio.migrate_legacy_portfolio_to_user(user.id) is True
+    assert destination.exists()
+    assert portfolio.PORTFOLIO_FILE.exists()
+    destination.unlink()
+    assert portfolio.migrate_legacy_portfolio_to_user(user.id) is False
     assert not destination.exists()

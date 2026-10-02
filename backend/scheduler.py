@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
+import sqlite3
 import threading
 import time
 
@@ -19,27 +21,40 @@ _RETRY_SECONDS = 300.0
 
 def _schedule_row(user_id: int) -> float | None:
     with db.connect() as conn:
-        row = conn.execute(
-            "SELECT next_run_at FROM auto_scan_state WHERE user_id = ?",
-            (user_id,),
-        ).fetchone()
+        return _schedule_row_conn(conn, user_id)
+
+
+def _schedule_row_conn(conn, user_id: int) -> float | None:
+    row = conn.execute(
+        "SELECT next_run_at FROM auto_scan_state WHERE user_id = ?",
+        (user_id,),
+    ).fetchone()
     if row is None:
         return None
     try:
         value = float(row["next_run_at"])
     except (TypeError, ValueError):
         return None
-    return value if value == value else None
+    return value if math.isfinite(value) else None
 
 
 def _write_schedule(user_id: int, next_run_at: float, last_run_at: float | None = None) -> None:
     with db.connect() as conn:
-        conn.execute(
-            "INSERT INTO auto_scan_state (user_id, next_run_at, last_run_at) "
-            "VALUES (?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET "
-            "next_run_at = excluded.next_run_at, last_run_at = excluded.last_run_at",
-            (user_id, next_run_at, last_run_at),
-        )
+        _write_schedule_conn(conn, user_id, next_run_at, last_run_at)
+
+
+def _write_schedule_conn(
+    conn,
+    user_id: int,
+    next_run_at: float,
+    last_run_at: float | None = None,
+) -> None:
+    conn.execute(
+        "INSERT INTO auto_scan_state (user_id, next_run_at, last_run_at) "
+        "VALUES (?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET "
+        "next_run_at = excluded.next_run_at, last_run_at = excluded.last_run_at",
+        (user_id, next_run_at, last_run_at),
+    )
 
 
 def reset_auto_scan_schedule(user_id: int, *, enabled: bool) -> None:
@@ -67,16 +82,52 @@ def _claim_due(
     current: float,
     state: dict[int, float],
 ) -> bool:
-    persisted_next = _schedule_row(user_id)
-    next_run = persisted_next if persisted_next is not None else state.get(user_id)
-    if next_run is not None and next_run > current:
-        state[user_id] = next_run
-        return False
+    """Atomically claim one due slot.
 
+    The write is a compare-and-set on ``next_run_at`` so two concurrent
+    invocations (a stray second process, a manual trigger, a future scale-out)
+    cannot both claim the same slot and broadcast twice.  A row with no stored
+    schedule is inserted once; SQLite's primary key rejects the loser.
+    """
     next_due = current + interval_seconds
-    _write_schedule(user_id, next_due, current)
-    state[user_id] = next_due
-    return True
+    with db.connect() as conn:
+        stored = _schedule_row_conn(conn, user_id)
+        if stored is None:
+            try:
+                conn.execute(
+                    "INSERT INTO auto_scan_state (user_id, next_run_at, last_run_at) "
+                    "VALUES (?, ?, ?)",
+                    (user_id, next_due, current),
+                )
+            except sqlite3.IntegrityError:
+                # Another process inserted the row first; it owns this slot.
+                return False
+            claimed = True
+        else:
+            cur = conn.execute(
+                "UPDATE auto_scan_state SET next_run_at = ?, last_run_at = ? "
+                "WHERE user_id = ? AND next_run_at <= ?",
+                (next_due, current, user_id, current),
+            )
+            claimed = cur.rowcount == 1
+            if not claimed:
+                state[user_id] = _schedule_row_conn(conn, user_id) or stored
+    if claimed:
+        state[user_id] = next_due
+    return claimed
+
+
+def _retry_later(user_id: int, current: float, state: dict[int, float]) -> None:
+    """Back off a slot without touching ``last_run_at``.
+
+    ``last_run_at`` records an actual completed scan; deferrals (shutdown,
+    provider failure, revoked capability, invalid settings) must not make a
+    never-executed run look successful.
+    """
+
+    next_attempt = current + _RETRY_SECONDS
+    state[user_id] = next_attempt
+    _write_schedule(user_id, next_attempt, None)
 
 
 def run_due_auto_scans(
@@ -108,12 +159,10 @@ def run_due_auto_scans(
             settings = AutoScanSettingsRequest.model_validate(raw)
         except Exception:
             logger.warning("Skipping invalid auto-scan settings for user %d", user_id)
-            schedule_state[user_id] = current + _RETRY_SECONDS
-            _write_schedule(user_id, current + _RETRY_SECONDS, current)
+            _retry_later(user_id, current, schedule_state)
             continue
         if not settings.enabled or not bool(row["can_send_alerts"]):
-            schedule_state[user_id] = current + _RETRY_SECONDS
-            _write_schedule(user_id, current + _RETRY_SECONDS, current)
+            _retry_later(user_id, current, schedule_state)
             continue
         if _claim_due(
             user_id,
@@ -126,9 +175,13 @@ def run_due_auto_scans(
     started = 0
     for user_id, settings in due:
         if stop_event is not None and stop_event.is_set():
-            break
+            # Shutting down before the run: release the claim so the next
+            # process start retries instead of silently skipping an interval.
+            _retry_later(user_id, current, schedule_state)
+            continue
         try:
             if not _can_send_alerts(user_id):
+                _retry_later(user_id, current, schedule_state)
                 continue
             scanner = AlertScanner(
                 tickers=settings.tickers,
@@ -136,10 +189,12 @@ def run_due_auto_scans(
             )
             results = scanner.scan()
             if stop_event is not None and stop_event.is_set():
+                _retry_later(user_id, current, schedule_state)
                 continue
             # Re-check after provider work, immediately before the irreversible
             # external delivery, so a revoked capability takes effect promptly.
             if not _can_send_alerts(user_id):
+                _retry_later(user_id, current, schedule_state)
                 continue
             scanner.deliver_results(
                 results,
@@ -149,6 +204,7 @@ def run_due_auto_scans(
             started += 1
         except Exception:
             logger.exception("Scheduled auto-scan failed")
+            _retry_later(user_id, current, schedule_state)
     return started
 
 
