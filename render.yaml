@@ -21,26 +21,49 @@ services:
         value: "true"
       - key: TSE_ADMIN_USER
         sync: true
+      # Render generates a random password on first deploy; read it from the
+      # dashboard, sign in once, then rotate it and clear this value. An unset
+      # value would leave the deployment with zero users and no recovery path.
       - key: TSE_ADMIN_PASSWORD
-        sync: false
+        generateValue: true
       - key: TSE_JWT_SECRET
         generateValue: true
       # Set this in the Render dashboard when the frontend is on another
       # origin. Same-origin deployments should leave it empty.
       - key: TSE_CORS_ORIGINS
         sync: false
-      # Set only the proxy ranges that terminate public traffic.
+      # REQUIRED before public traffic: Render's edge proxy addresses. Without
+      # this, every request shares one rate-limit bucket and the login lockout
+      # loses its per-client meaning. Never use 0.0.0.0/0 here.
       - key: TSE_TRUSTED_PROXY_CIDRS
         sync: false
       - key: TSE_PROVIDER_MIN_INTERVAL_MS
         value: "25"
       - key: TSE_MAX_REQUEST_BYTES
         value: "2097152"
+      - key: TSE_MAX_REQUEST_CHUNKS
+        value: "4096"
+      - key: TSE_MAX_REQUEST_BODY_SECONDS
+        value: "10"
+      - key: TSE_API_RATE_LIMIT
+        value: "120"
+      - key: TSE_ASSET_RATE_LIMIT
+        value: "600"
+      - key: TSE_LOGIN_RATE_LIMIT
+        value: "30"
+      - key: TSE_ALERT_RATE_LIMIT
+        value: "10"
+      - key: TSE_PROVIDER_RATE_LIMIT
+        value: "30"
       - key: TSE_CACHE_MAX_FILES
         value: "2000"
       - key: TSE_CACHE_MAX_BYTES
         value: "536870912"
+      - key: TSE_FUND_CACHE_MAX_ENTRIES
+        value: "512"
       - key: TSE_LEGACY_PORTFOLIO_USER_ID
+        sync: false
+      - key: TSE_LEGACY_PORTFOLIO_USERNAME
         sync: false
       - key: TSE_DATA_DIR
         value: /data
