@@ -186,7 +186,10 @@ def test_token_version_embedded_in_jwt(_isolated_db: None) -> None:
     assert jwt_auth.verify_token(token2)["tv"] == 1
 
 
-def test_known_bootstrap_credential_is_revoked_on_startup(_isolated_db: None) -> None:
+def test_known_bootstrap_credential_is_revoked_on_startup(
+    _isolated_db: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(auth.db, "DATA_DIR", tmp_path)
     with db.connect() as conn:
         conn.execute(
             "INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, ?)",
@@ -194,6 +197,16 @@ def test_known_bootstrap_credential_is_revoked_on_startup(_isolated_db: None) ->
         )
     assert auth.revoke_known_bootstrap_credentials() == 1
     assert auth.verify_user("admin", "change-me-now-please") is None
+
+    # The rotation must stay recoverable: a single-admin deployment has no
+    # self-service setup path once a user exists.
+    recovery = tmp_path / "bootstrap-credential-recovery.txt"
+    assert recovery.exists()
+    assert recovery.stat().st_mode & 0o077 == 0
+    recovered = recovery.read_text(encoding="utf-8")
+    assert "username: admin" in recovered
+    replacement = recovered.split("one-time password: ")[1].splitlines()[0].strip()
+    assert auth.verify_user("admin", replacement) is not None
 
 
 def test_startup_revocation_does_not_revoke_active_environment_credential(
@@ -207,8 +220,9 @@ def test_startup_revocation_does_not_revoke_active_environment_credential(
 
 
 def test_startup_revocation_covers_custom_admin_placeholder(
-    monkeypatch: pytest.MonkeyPatch, _isolated_db: None
+    monkeypatch: pytest.MonkeyPatch, _isolated_db: None, tmp_path: Path
 ) -> None:
+    monkeypatch.setattr(auth.db, "DATA_DIR", tmp_path)
     monkeypatch.setenv("TSE_ADMIN_USER", "boss")
     monkeypatch.setenv("TSE_ADMIN_PASSWORD", "strong-env-password")
     with db.connect() as conn:

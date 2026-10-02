@@ -403,6 +403,12 @@ def revoke_known_bootstrap_credentials() -> int:
     The currently configured environment credential is an active operator
     secret, not a known compromised placeholder.  It must remain usable after
     startup; rotating it requires an explicit password-management action.
+
+    When a placeholder *is* found, the replacement is written to a mode-0600
+    recovery file inside ``TSE_DATA_DIR``.  Rotating to an undisclosed random
+    value would otherwise lock a single-admin deployment out permanently:
+    ``/auth/setup-status`` still reports "has users", so there is no self-service
+    path back in.
     """
 
     candidates = {("admin", password) for password in _PLACEHOLDER_PASSWORDS}
@@ -410,6 +416,7 @@ def revoke_known_bootstrap_credentials() -> int:
     if configured_user:
         candidates.update((configured_user, password) for password in _PLACEHOLDER_PASSWORDS)
     revoked = 0
+    recovery_path = db.DATA_DIR / "bootstrap-credential-recovery.txt"
     for username, password in candidates:
         if get_by_username(username) is None:
             continue
@@ -423,12 +430,32 @@ def revoke_known_bootstrap_credentials() -> int:
                 "WHERE id = ?",
                 (hash_password(replacement), record.id),
             )
+        _write_recovery_file(recovery_path, username, replacement)
         logger.critical(
-            "Revoked a known bootstrap credential for user id=%d; set a new password",
+            "Revoked a known bootstrap credential for user id=%d; a one-time "
+            "recovery password was written to %s — sign in and rotate it now",
             record.id,
+            recovery_path,
         )
         revoked += 1
     return revoked
+
+
+def _write_recovery_file(path: Path, username: str, password: str) -> None:
+    """Persist a one-time recovery credential with owner-only permissions."""
+
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "A known placeholder bootstrap credential was revoked on startup.\n"
+            f"username: {username}\n"
+            f"one-time password: {password}\n"
+            "Sign in, change this password immediately, then delete this file.\n",
+            encoding="utf-8",
+        )
+        path.chmod(0o600)
+    except OSError:
+        logger.exception("Could not write the bootstrap recovery file at %s", path)
 
 
 # ---------------------------------------------------------------------------

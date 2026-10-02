@@ -91,6 +91,34 @@ def health() -> dict[str, Any]:
     return _health_payload()
 
 
+def _warn_on_untrusted_deployment() -> None:
+    """Surface configuration that silently collapses per-client controls.
+
+    Behind a reverse proxy with no trusted CIDRs configured, every request
+    shares one rate-limit bucket and the durable login lockout stops being
+    per-client. That is an availability problem, not a spoofing one, so it is
+    a loud startup warning plus a runbook item rather than a hard failure.
+    """
+
+    environment = os.getenv("TSE_ENVIRONMENT", "development").strip().lower()
+    if environment not in {"production", "prod"}:
+        return
+    if not os.getenv("TSE_TRUSTED_PROXY_CIDRS", "").strip():
+        logger.critical(
+            "TSE_TRUSTED_PROXY_CIDRS is unset in production: if this service runs "
+            "behind a proxy, all clients share one rate-limit bucket and the "
+            "login lockout loses its per-client meaning. Set the platform's "
+            "documented proxy ranges before serving public traffic."
+        )
+    if db.user_count() == 0 and not os.getenv("TSE_ADMIN_PASSWORD", "").strip():
+        logger.critical(
+            "No users exist and TSE_ADMIN_PASSWORD is unset: this deployment has "
+            "no login path. Set the bootstrap password and restart, or create an "
+            "account from a shell with "
+            "`python -m src.stock_screener.auth create-user <user> <password>`."
+        )
+
+
 def _initialise_storage() -> None:
     """Initialize SQLite and the optional environment bootstrap account."""
 
@@ -99,6 +127,7 @@ def _initialise_storage() -> None:
     auth.bootstrap_admin_from_env()
     auth.revoke_known_bootstrap_credentials()
     enforce_cache_quota()
+    _warn_on_untrusted_deployment()
 
 
 def _bool_env(name: str, default: bool) -> bool:

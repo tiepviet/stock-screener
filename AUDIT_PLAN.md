@@ -66,6 +66,13 @@ The following controls are present and should be preserved:
 - Portfolio admission enforces per-position capital, aggregate capital, per-trade risk, and sector concentration inside the locked transaction.
 - Canonicalized forwarded-address parsing so equivalent IPv6 spellings share one rate-limit bucket; alert scans use the alert-delivery budget, and immutable assets have their own bucket.
 - Atomic watchlist batch writes, legacy-migration owner identity verification, and Telegram test-message HTML escaping.
+- Startup warnings for production deployments with no trusted proxy CIDRs and no login path.
+
+### Operator note: bootstrap credential recovery file
+
+Revoking a known placeholder bootstrap password used to rotate the account to an undisclosed random value, which could permanently lock a single-admin deployment out with no self-service recovery. `revoke_known_bootstrap_credentials()` now writes `bootstrap-credential-recovery.txt` into `TSE_DATA_DIR` with mode `0600`, containing the username and the one-time password.
+
+**Operational rule:** read it from the server shell, sign in, rotate the password, then delete the file. `data/` is gitignored, but the file is still a plaintext credential on disk and must not be copied into logs, tickets, or backups.
 - Persistent Render disk, health check, one-worker configuration, and pinned Node/Python versions.
 - React build succeeds and the current npm dependency audit is clean.
 - Streamlit has been moved to an explicitly unsupported `legacy/` reference directory.
