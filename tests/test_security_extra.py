@@ -6,6 +6,7 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import anyio
 import pytest
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
@@ -101,6 +102,50 @@ def test_body_limits_cover_unframed_get_and_disconnects(
         method="GET",
     )
     assert status == 413
+    assert called is False
+
+
+def test_slow_request_body_times_out_without_calling_handler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TSE_MAX_REQUEST_BODY_SECONDS", "1")
+    monkeypatch.setattr(security_module, "_RATE_LIMITER", security_module._RateLimiter())
+    sent: list[dict] = []
+    called = False
+
+    async def downstream(scope, receive, send):
+        nonlocal called
+        called = True
+        request = Request(scope, receive)
+        await request.body()
+
+    async def run() -> None:
+        async def receive():
+            await anyio.sleep(5)
+            return {"type": "http.request", "body": b"", "more_body": True}
+
+        async def send(message):
+            sent.append(message)
+
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0", "spec_version": "2.3"},
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/probe",
+            "raw_path": b"/probe",
+            "query_string": b"",
+            "root_path": "",
+            "headers": [],
+            "client": ("127.0.0.1", 1234),
+            "server": ("testserver", 80),
+        }
+        await SecurityHeadersMiddleware(downstream)(scope, receive, send)
+
+    asyncio.run(run())
+    status = next(m["status"] for m in sent if m["type"] == "http.response.start")
+    assert status == 408
     assert called is False
 
 

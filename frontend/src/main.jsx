@@ -217,9 +217,47 @@ function ChartView({ settings }) {
   const [lookback, setLookback] = useState(settings.lookback_days)
   const [showSma, setShowSma] = useState(true)
   const [showVolume, setShowVolume] = useState(true)
+  const [hydrated, setHydrated] = useState(false)
+  const chartPrefs = useRef({})
   const chart = useAsync(() => api.chart(ticker, { interval, lookback_days: lookback, indicators: 'sma20,sma50,sma200,volume' }), [ticker, interval, lookback])
   const candles = chart.value?.candles || []
   const latest = candles[candles.length - 1]
+
+  // Restore the viewer's last chart selection; the legacy dashboard persisted
+  // the same preferences and losing them on every reload was a migration gap.
+  useEffect(() => {
+    let active = true
+    api.getChartSettings()
+      .then((saved) => {
+        if (!active || !saved) return
+        if (saved.ticker) setTickerInput(String(saved.ticker).toUpperCase())
+        if (saved.interval) setIntervalValue(saved.interval)
+        if (saved.lookback_days) setLookback(String(saved.lookback_days))
+        if (typeof saved.show_sma === 'boolean') setShowSma(saved.show_sma)
+        if (typeof saved.show_volume === 'boolean') setShowVolume(saved.show_volume)
+      })
+      .catch(() => {})
+      .finally(() => { if (active) setHydrated(true) })
+    return () => { active = false }
+  }, [])
+
+  // Persist after hydration only, debounced so typing a ticker does not emit
+  // a write per keystroke.
+  useEffect(() => {
+    if (!hydrated) return undefined
+    const payload = {
+      ticker: tickerInput,
+      interval,
+      lookback_days: Number(lookback) || settings.lookback_days,
+      show_sma: showSma,
+      show_volume: showVolume,
+    }
+    if (JSON.stringify(payload) === JSON.stringify(chartPrefs.current)) return undefined
+    chartPrefs.current = payload
+    const timer = setTimeout(() => { api.saveChartSettings(payload).catch(() => {}) }, 600)
+    return () => clearTimeout(timer)
+  }, [hydrated, tickerInput, interval, lookback, showSma, showVolume, settings.lookback_days])
+
   return <><SectionTitle kicker="MARKET OVERVIEW">Price action</SectionTitle><div className="toolbar"><Field label="Ticker"><Input value={tickerInput} onChange={(e) => setTickerInput(e.target.value.toUpperCase())} /></Field><Field label="Interval"><Select value={interval} onChange={(e) => setIntervalValue(e.target.value)}><option>1d</option><option>1h</option><option>1wk</option></Select></Field><Field label="Lookback (days)"><Input type="number" min="30" max="1095" value={lookback} onChange={(e) => setLookback(e.target.value)} /></Field><Button onClick={() => chart.run()} loading={chart.loading}>Refresh data</Button></div><div className="stat-grid">{[['Last close', latest ? yen(latest.close) : '—', latest?.date], ['Change', latest?.change_pct != null ? pct(latest.change_pct) : '—', 'vs prior close'], ['SMA 20', latest?.sma_20 ? yen(latest.sma_20) : '—', 'technical trend'], ['Volume', latest?.volume ? fmt(latest.volume) : '—', 'latest bar']].map(([label, value, detail]) => <Stat key={label} label={label} value={value} detail={detail} />)}</div><Panel title={`${ticker || '—'} · ${interval}`} subtitle="Candlestick and technical overlays" action={<div className="inline-controls"><Toggle checked={showSma} onChange={setShowSma} label="SMA" /><Toggle checked={showVolume} onChange={setShowVolume} label="Volume" /></div>}>{chart.error && <Alert kind="error">{chart.error}</Alert>}<CandlestickChart candles={candles} showSma={showSma} showVolume={showVolume} /></Panel>{candles.length > 0 && <Panel title="Latest observations" subtitle={`${candles.length} bars returned by the data provider`}><Table columns={[{ key: 'date', label: 'Date' }, { key: 'open', label: 'Open', render: (r) => yen(r.open) }, { key: 'high', label: 'High', render: (r) => yen(r.high) }, { key: 'low', label: 'Low', render: (r) => yen(r.low) }, { key: 'close', label: 'Close', render: (r) => yen(r.close) }, { key: 'volume', label: 'Volume', render: (r) => fmt(r.volume) }]} rows={candles.slice(-10).reverse()} /></Panel>}</>
 }
 

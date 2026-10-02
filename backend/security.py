@@ -16,6 +16,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from threading import RLock
 
+import anyio
 from fastapi import Request
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -165,6 +166,18 @@ def _max_request_chunks() -> int:
     return _int_env("TSE_MAX_REQUEST_CHUNKS", 4096, 16, 65_536)
 
 
+def _max_request_body_seconds() -> float:
+    """Wall-clock budget for receiving one request body."""
+
+    raw = os.getenv("TSE_MAX_REQUEST_BODY_SECONDS", "10")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        logger.warning("Ignoring invalid TSE_MAX_REQUEST_BODY_SECONDS")
+        return 10.0
+    return max(1.0, min(value, 120.0))
+
+
 def _rate_limit_for(path: str) -> tuple[str, int, float]:
     """Choose a stable policy based on endpoint cost, not the concrete path."""
 
@@ -261,31 +274,37 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         # Buffer every ASGI request, including an unframed GET/HEAD body. The
         # server normally supplies an empty http.request message for bodyless
         # methods, and always buffering keeps the limit authoritative across
-        # ASGI servers and HTTP/2 transports.
+        # ASGI servers and HTTP/2 transports. The wall-clock budget stops a slow
+        # client from pinning a worker with a trickled, never-finished body.
         messages = []
         total = 0
-        while True:
-            message = await request.receive()
-            message_type = message.get("type")
-            if message_type == "http.disconnect":
-                # Never hand a partial/disconnected request to a state-changing
-                # route. There is no useful response to send to a gone client,
-                # but returning a deterministic response keeps ASGI callers
-                # from observing a misleading parser error.
-                return body_error(400, "Client disconnected before request completed")
-            if message_type != "http.request":
-                return body_error(400, "Invalid request body framing")
-            body = message.get("body", b"") or b""
-            if not isinstance(body, (bytes, bytearray, memoryview)):
-                return body_error(400, "Invalid request body framing")
-            if len(messages) >= chunk_limit:
-                return body_error(413, "Request body has too many chunks")
-            total += len(body)
-            if total > body_limit:
-                return body_error(413, "Request body is too large")
-            messages.append(message)
-            if not message.get("more_body", False):
-                break
+        body_deadline = _max_request_body_seconds()
+        try:
+            with anyio.fail_after(body_deadline):
+                while True:
+                    message = await request.receive()
+                    message_type = message.get("type")
+                    if message_type == "http.disconnect":
+                        # Never hand a partial/disconnected request to a
+                        # state-changing route. There is no useful response to
+                        # send to a gone client, but a deterministic response
+                        # keeps ASGI callers from seeing a parser error.
+                        return body_error(400, "Client disconnected before request completed")
+                    if message_type != "http.request":
+                        return body_error(400, "Invalid request body framing")
+                    body = message.get("body", b"") or b""
+                    if not isinstance(body, (bytes, bytearray, memoryview)):
+                        return body_error(400, "Invalid request body framing")
+                    if len(messages) >= chunk_limit:
+                        return body_error(413, "Request body has too many chunks")
+                    total += len(body)
+                    if total > body_limit:
+                        return body_error(413, "Request body is too large")
+                    messages.append(message)
+                    if not message.get("more_body", False):
+                        break
+        except TimeoutError:
+            return body_error(408, "Request body took too long to arrive")
 
         if declared_size is not None and total != declared_size:
             return body_error(400, "Request body length does not match Content-Length")
